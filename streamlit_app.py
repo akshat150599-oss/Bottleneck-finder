@@ -8,6 +8,48 @@ st.set_page_config(page_title="Ocean Bottleneck Analyzer", layout="wide")
 st.title("📦 Ocean Bottleneck Analyzer")
 st.caption("Identify bottlenecks between key port milestones at Carrier → Port level")
 
+# --- Optional dependency checks (so we don't crash if engines aren't installed)
+def has_openpyxl() -> bool:
+    try:
+        import openpyxl  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+def has_xlrd_12() -> bool:
+    try:
+        import xlrd  # noqa: F401
+        # xlrd >= 2.0 removed .xls support; we want 1.2.0 specifically
+        import pkg_resources
+        ver = pkg_resources.get_distribution("xlrd").version
+        return ver.startswith("1.2")
+    except Exception:
+        return False
+
+HAS_OPENPYXL = has_openpyxl()
+HAS_XLRD12 = has_xlrd_12()
+
+# Let users know what's supported in THIS environment
+support_msg = []
+if HAS_OPENPYXL:
+    support_msg.append("✅ .xlsx (openpyxl)")
+else:
+    support_msg.append("❌ .xlsx (install `openpyxl`)")
+
+if HAS_XLRD12:
+    support_msg.append("✅ .xls (xlrd==1.2.0)")
+else:
+    support_msg.append("❌ .xls (install `xlrd==1.2.0` if needed)")
+
+st.info("File support in this environment: " + " | ".join(support_msg))
+
+# Allowed types reflect what can actually be read right now
+allowed_types = ["csv"]
+if HAS_OPENPYXL:
+    allowed_types.append("xlsx")
+if HAS_XLRD12:
+    allowed_types.append("xls")
+
 st.markdown("""
 **What it computes**
 - **POL**: Gate In → Container Loaded  
@@ -17,24 +59,34 @@ Mode is taken on durations rounded to 1 decimal for stability.
 """)
 
 # -----------------------
-# File loader (robust)
+# File upload
+# -----------------------
+uploaded = st.file_uploader("Upload your file", type=allowed_types)
+if not uploaded:
+    st.stop()
+
+name = uploaded.name.lower()
+
+# -----------------------
+# Loaders
 # -----------------------
 @st.cache_data
-def load_excel_bytes(uploaded_file: "st.runtime.uploaded_file_manager.UploadedFile") -> bytes:
-    # Read the entire file once; reuse bytes for ExcelFile & read_excel
+def load_csv(file):
+    return pd.read_csv(file)
+
+@st.cache_data
+def load_excel_bytes(uploaded_file) -> bytes:
     return uploaded_file.getvalue()
 
-def try_build_xls(bytes_data: bytes, is_xlsx: bool):
-    """Return (ExcelFile, engine) or (None, None) with a clear UI error if engine missing."""
+def excel_file(bytes_data: bytes, is_xlsx: bool):
     engine = "openpyxl" if is_xlsx else "xlrd"
     try:
-        xls = pd.ExcelFile(BytesIO(bytes_data), engine=engine)
-        return xls, engine
+        return pd.ExcelFile(BytesIO(bytes_data), engine=engine), engine
     except ImportError as e:
         if is_xlsx:
-            st.error("Missing Excel engine **openpyxl** for .xlsx files. Install with:\n\n`pip install openpyxl`")
+            st.error("`.xlsx` reading needs **openpyxl**. Add to requirements.txt or run: `pip install openpyxl`")
         else:
-            st.error("Reading legacy **.xls** needs `xlrd==1.2.0`.\n\nInstall with:\n\n`pip install xlrd==1.2.0`")
+            st.error("`.xls` reading needs **xlrd==1.2.0**. Add to requirements.txt or run: `pip install xlrd==1.2.0`")
         st.stop()
     except Exception as e:
         st.error(f"Failed to open Excel file: {e}")
@@ -47,9 +99,6 @@ def read_sheet(bytes_data: bytes, sheet_name: str, engine: str) -> pd.DataFrame:
         st.error(f"Failed to read sheet '{sheet_name}': {e}")
         st.stop()
 
-# -----------------------
-# Helpers
-# -----------------------
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
@@ -63,8 +112,8 @@ def find_col(df: pd.DataFrame, name_variants):
     return None
 
 def to_datetime(series: pd.Series, dayfirst: bool = True) -> pd.Series:
-    # Robust parser for strings like "dd/mm/yy hh:mm:ss AM/PM"
-    return pd.to_datetime(series, errors="coerce", dayfirst=dayfirst, infer_datetime_format=True)
+    # Robust for "DD/MM/YY HH:MM:SS AM/PM"
+    return pd.to_datetime(series, errors="coerce", dayfirst=dayfirst)
 
 def compute_duration_hours(start: pd.Series, end: pd.Series) -> pd.Series:
     return (end - start).dt.total_seconds() / 3600.0
@@ -72,12 +121,21 @@ def compute_duration_hours(start: pd.Series, end: pd.Series) -> pd.Series:
 def summarize(series: pd.Series, mode_round: int = 1) -> pd.Series:
     s = pd.to_numeric(series, errors="coerce").dropna()
     if len(s) == 0:
-        return pd.Series({"count": 0, "avg_hours": np.nan, "mean_hours": np.nan, "median_hours": np.nan, "mode_hours": np.nan})
+        return pd.Series({
+            "count": 0, "avg_hours": np.nan, "mean_hours": np.nan,
+            "median_hours": np.nan, "mode_hours": np.nan
+        })
     avg_val = s.mean()
     median_val = s.median()
     mode_vals = s.round(mode_round).mode()
     mode_val = mode_vals.iloc[0] if len(mode_vals) else np.nan
-    return pd.Series({"count": len(s), "avg_hours": avg_val, "mean_hours": avg_val, "median_hours": median_val, "mode_hours": mode_val})
+    return pd.Series({
+        "count": len(s),
+        "avg_hours": avg_val,
+        "mean_hours": avg_val,
+        "median_hours": median_val,
+        "mode_hours": mode_val
+    })
 
 def build_summary(df: pd.DataFrame, group_cols, value_col: str, label: str, mode_round: int = 1) -> pd.DataFrame:
     g = (
@@ -95,29 +153,24 @@ def build_summary(df: pd.DataFrame, group_cols, value_col: str, label: str, mode
     return g
 
 # -----------------------
-# UI: File upload
+# Read file into DataFrame
 # -----------------------
-uploaded = st.file_uploader("Upload your file (.xlsx, .xls, .csv)", type=["xlsx", "xls", "csv"])
-
-if not uploaded:
-    st.info("Upload a file to begin the analysis.")
-    st.stop()
-
-name = uploaded.name.lower()
-
-# Read CSV quickly
 if name.endswith(".csv"):
-    df_raw = pd.read_csv(uploaded)
-    excel_bytes = None
-    excel_engine = None
+    df_raw = load_csv(uploaded)
     sheet_name = None
 else:
-    # Excel path
-    excel_bytes = load_excel_bytes(uploaded)
     is_xlsx = name.endswith(".xlsx")
-    xls, excel_engine = try_build_xls(excel_bytes, is_xlsx=is_xlsx)
+    if is_xlsx and not HAS_OPENPYXL:
+        st.error("This environment can't read `.xlsx` yet. Install **openpyxl** or upload a CSV.")
+        st.stop()
+    if (not is_xlsx) and (not HAS_XLRD12):
+        st.error("This environment can't read legacy `.xls`. Install **xlrd==1.2.0** or upload a CSV.")
+        st.stop()
+
+    excel_bytes = load_excel_bytes(uploaded)
+    xls, engine = excel_file(excel_bytes, is_xlsx=is_xlsx)
     sheet_name = st.selectbox("Choose sheet", xls.sheet_names, index=0)
-    df_raw = read_sheet(excel_bytes, sheet_name, engine=excel_engine)
+    df_raw = read_sheet(excel_bytes, sheet_name, engine=engine)
 
 df_raw = normalize_columns(df_raw)
 
@@ -138,15 +191,23 @@ default_cols = {
 with st.expander("Column Mapping", expanded=True):
     c1, c2 = st.columns(2)
     with c1:
-        carrier_col = st.selectbox("Carrier column", options=df_raw.columns, index=df_raw.columns.get_loc(default_cols["carrier"]) if default_cols["carrier"] in df_raw.columns else 0)
-        pol_col = st.selectbox("POL (Port of Loading) column", options=df_raw.columns, index=df_raw.columns.get_loc(default_cols["pol"]) if default_cols["pol"] in df_raw.columns else 0)
-        gate_in_col = st.selectbox("2-Gate In Timestamp", options=df_raw.columns, index=df_raw.columns.get_loc(default_cols["gate_in"]) if default_cols["gate_in"] in df_raw.columns else 0)
-        container_loaded_col = st.selectbox("3-Container Loaded Timestamp", options=df_raw.columns, index=df_raw.columns.get_loc(default_cols["container_loaded"]) if default_cols["container_loaded"] in df_raw.columns else 0)
+        carrier_col = st.selectbox("Carrier column", options=df_raw.columns,
+                                   index=df_raw.columns.get_loc(default_cols["carrier"]) if default_cols["carrier"] in df_raw.columns else 0)
+        pol_col = st.selectbox("POL (Port of Loading) column", options=df_raw.columns,
+                               index=df_raw.columns.get_loc(default_cols["pol"]) if default_cols["pol"] in df_raw.columns else 0)
+        gate_in_col = st.selectbox("2-Gate In Timestamp", options=df_raw.columns,
+                                   index=df_raw.columns.get_loc(default_cols["gate_in"]) if default_cols["gate_in"] in df_raw.columns else 0)
+        container_loaded_col = st.selectbox("3-Container Loaded Timestamp", options=df_raw.columns,
+                                            index=df_raw.columns.get_loc(default_cols["container_loaded"]) if default_cols["container_loaded"] in df_raw.columns else 0)
     with c2:
-        pod_col = st.selectbox("POD (Port of Discharge) column", options=df_raw.columns, index=df_raw.columns.get_loc(default_cols["pod"]) if default_cols["pod"] in df_raw.columns else 0)
-        discharge_col = st.selectbox("6-Container Discharge Timestamp", options=df_raw.columns, index=df_raw.columns.get_loc(default_cols["discharge"]) if default_cols["discharge"] in df_raw.columns else 0)
-        gate_out_col = st.selectbox("7-Gate Out Timestamp", options=df_raw.columns, index=df_raw.columns.get_loc(default_cols["gate_out"]) if default_cols["gate_out"] in df_raw.columns else 0)
-        empty_return_col = st.selectbox("8-Empty Return Timestamp", options=df_raw.columns, index=df_raw.columns.get_loc(default_cols["empty_return"]) if default_cols["empty_return"] in df_raw.columns else 0)
+        pod_col = st.selectbox("POD (Port of Discharge) column", options=df_raw.columns,
+                               index=df_raw.columns.get_loc(default_cols["pod"]) if default_cols["pod"] in df_raw.columns else 0)
+        discharge_col = st.selectbox("6-Container Discharge Timestamp", options=df_raw.columns,
+                                     index=df_raw.columns.get_loc(default_cols["discharge"]) if default_cols["discharge"] in df_raw.columns else 0)
+        gate_out_col = st.selectbox("7-Gate Out Timestamp", options=df_raw.columns,
+                                    index=df_raw.columns.get_loc(default_cols["gate_out"]) if default_cols["gate_out"] in df_raw.columns else 0)
+        empty_return_col = st.selectbox("8-Empty Return Timestamp", options=df_raw.columns,
+                                        index=df_raw.columns.get_loc(default_cols["empty_return"]) if default_cols["empty_return"] in df_raw.columns else 0)
 
 # -----------------------
 # Settings
@@ -155,8 +216,9 @@ st.divider()
 st.subheader("Settings")
 dayfirst = st.checkbox("Dates are day-first (DD/MM/YYYY)", value=True)
 unit = st.selectbox("Units", ["hours", "minutes"], index=0)
-mode_round = st.slider("Mode rounding (units)", 0, 3, 1, help="Round durations to this many decimals before calculating the mode.")
-negative_policy = st.selectbox("How to handle negative durations", ["Keep (could indicate data error)", "Treat as NaN (drop from stats)"], index=1)
+mode_round = st.slider("Mode rounding (units)", 0, 3, 1)
+negative_policy = st.selectbox("How to handle negative durations",
+                               ["Keep (could indicate data error)", "Treat as NaN (drop from stats)"], index=1)
 
 def convert_units(series: pd.Series) -> pd.Series:
     return series * 60.0 if unit == "minutes" else series
@@ -164,7 +226,6 @@ def convert_units(series: pd.Series) -> pd.Series:
 # -----------------------
 # Compute durations
 # -----------------------
-# Parse timestamps per selected columns
 gate_in_dt = to_datetime(df_raw[gate_in_col], dayfirst=dayfirst)
 container_loaded_dt = to_datetime(df_raw[container_loaded_col], dayfirst=dayfirst)
 discharge_dt = to_datetime(df_raw[discharge_col], dayfirst=dayfirst)
@@ -182,8 +243,8 @@ if negative_policy == "Treat as NaN (drop from stats)":
 
 df = df_raw.copy()
 df["_Carrier"] = df[carrier_col].astype(str)
-df["_POL Port"] = df[pol_col].astype(str)
-df["_POD Port"] = df[pod_col].astype(str)
+df["_POL Port"] = df[pol_col].astype(str) if pol_col else "UNKNOWN_POL"
+df["_POD Port"] = df[pod_col].astype(str) if pod_col else "UNKNOWN_POD"
 df["_POL_duration"] = convert_units(pol_gap)
 df["_POD_dg_duration"] = convert_units(pod_dg_gap)
 df["_POD_ge_duration"] = convert_units(pod_ge_gap)
@@ -197,13 +258,12 @@ if carriers:
     df = df[df["_Carrier"].isin(carriers)]
 
 # -----------------------
-# Summaries (Carrier → Port)
+# Summaries
 # -----------------------
 pol_summary = build_summary(df, ["_Carrier", "_POL Port"], "_POL_duration", "GateIn→ContainerLoaded (POL)", mode_round=mode_round)
 pod_dg_summary = build_summary(df, ["_Carrier", "_POD Port"], "_POD_dg_duration", "Discharge→GateOut (POD)", mode_round=mode_round)
 pod_ge_summary = build_summary(df, ["_Carrier", "_POD Port"], "_POD_ge_duration", "GateOut→EmptyReturn (POD)", mode_round=mode_round)
 
-# Harmonize column names and combine
 pol_summary = pol_summary.rename(columns={"_Carrier": "Carrier", "_POL Port": "POL Port"})
 pod_dg_summary = pod_dg_summary.rename(columns={"_Carrier": "Carrier", "_POD Port": "POD Port"})
 pod_ge_summary = pod_ge_summary.rename(columns={"_Carrier": "Carrier", "_POD Port": "POD Port"})
@@ -217,7 +277,6 @@ results = pd.concat([
     pod_ge_summary[["Carrier", "Metric", "POL Port", "POD Port", "count", "avg_hours", "mean_hours", "median_hours", "mode_hours"]],
 ], ignore_index=True)
 
-# Pretty names & rounding
 unit_suffix = " (mins)" if unit == "minutes" else " (hrs)"
 pretty = results.rename(columns={
     "avg_hours": "Average" + unit_suffix,
