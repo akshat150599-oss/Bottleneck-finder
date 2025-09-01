@@ -3,12 +3,13 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from io import BytesIO
+from pandas.tseries.offsets import BDay
 
 st.set_page_config(page_title="Ocean Bottleneck Analyzer", layout="wide")
 st.title("📦 Ocean Bottleneck Analyzer")
-st.caption("Identify bottlenecks between key port milestones at Carrier → Port level")
+st.caption("Identify bottlenecks and LFD risk at Carrier → Port level")
 
-# --- Optional dependency checks (so we don't crash if engines aren't installed)
+# --- Optional dependency checks (to avoid crashing if engines aren't installed)
 def has_openpyxl() -> bool:
     try:
         import openpyxl  # noqa: F401
@@ -19,7 +20,6 @@ def has_openpyxl() -> bool:
 def has_xlrd_12() -> bool:
     try:
         import xlrd  # noqa: F401
-        # xlrd >= 2.0 removed .xls support; we want 1.2.0 specifically
         import pkg_resources
         ver = pkg_resources.get_distribution("xlrd").version
         return ver.startswith("1.2")
@@ -29,21 +29,13 @@ def has_xlrd_12() -> bool:
 HAS_OPENPYXL = has_openpyxl()
 HAS_XLRD12 = has_xlrd_12()
 
-# Let users know what's supported in THIS environment
+# Show what this environment can read
 support_msg = []
-if HAS_OPENPYXL:
-    support_msg.append("✅ .xlsx (openpyxl)")
-else:
-    support_msg.append("❌ .xlsx (install `openpyxl`)")
-
-if HAS_XLRD12:
-    support_msg.append("✅ .xls (xlrd==1.2.0)")
-else:
-    support_msg.append("❌ .xls (install `xlrd==1.2.0` if needed)")
-
+support_msg.append("✅ .xlsx (openpyxl)" if HAS_OPENPYXL else "❌ .xlsx (install `openpyxl`)")
+support_msg.append("✅ .xls (xlrd==1.2.0)" if HAS_XLRD12 else "❌ .xls (install `xlrd==1.2.0` if needed)")
 st.info("File support in this environment: " + " | ".join(support_msg))
 
-# Allowed types reflect what can actually be read right now
+# Allowed upload types reflect available engines
 allowed_types = ["csv"]
 if HAS_OPENPYXL:
     allowed_types.append("xlsx")
@@ -51,17 +43,24 @@ if HAS_XLRD12:
     allowed_types.append("xls")
 
 st.markdown("""
-**What it computes**
-- **POL**: Gate In → Container Loaded  
-- **POD**: Discharge → Gate Out, Gate Out → Empty Return  
-For each **Carrier → Port**: **count, average (avg/mean), median, mode**.  
-Mode is taken on durations rounded to 1 decimal for stability.
+### What it computes
+**Durations**
+- **POL:** Gate In → Container Loaded  
+- **POD:** Discharge → Gate Out, Gate Out → Empty Return  
+For each **Carrier → Port**: **count, average (avg/mean), median, mode** (mode rounded to 1 decimal).
+
+**Estimated LFD**
+- **Estimated LFD** = Container Discharge (POD) + **Free Days** (calendar or business days).  
+- **Slack vs LFD (hours)** = _Estimated LFD − Gate Out_  
+- **Late** if Slack < 0; **On-time/Early** otherwise.
+
+You can upload an **optional Free-Days mapping CSV** to override the default (by Carrier + POD, POD only, or Carrier only).
 """)
 
 # -----------------------
-# File upload
+# Upload
 # -----------------------
-uploaded = st.file_uploader("Upload your file", type=allowed_types)
+uploaded = st.file_uploader("Upload your movement/export file", type=allowed_types)
 if not uploaded:
     st.stop()
 
@@ -82,7 +81,7 @@ def excel_file(bytes_data: bytes, is_xlsx: bool):
     engine = "openpyxl" if is_xlsx else "xlrd"
     try:
         return pd.ExcelFile(BytesIO(bytes_data), engine=engine), engine
-    except ImportError as e:
+    except ImportError:
         if is_xlsx:
             st.error("`.xlsx` reading needs **openpyxl**. Add to requirements.txt or run: `pip install openpyxl`")
         else:
@@ -153,7 +152,7 @@ def build_summary(df: pd.DataFrame, group_cols, value_col: str, label: str, mode
     return g
 
 # -----------------------
-# Read file into DataFrame
+# Read file → DataFrame
 # -----------------------
 if name.endswith(".csv"):
     df_raw = load_csv(uploaded)
@@ -224,7 +223,7 @@ def convert_units(series: pd.Series) -> pd.Series:
     return series * 60.0 if unit == "minutes" else series
 
 # -----------------------
-# Compute durations
+# Compute milestone durations
 # -----------------------
 gate_in_dt = to_datetime(df_raw[gate_in_col], dayfirst=dayfirst)
 container_loaded_dt = to_datetime(df_raw[container_loaded_col], dayfirst=dayfirst)
@@ -250,6 +249,114 @@ df["_POD_dg_duration"] = convert_units(pod_dg_gap)
 df["_POD_ge_duration"] = convert_units(pod_ge_gap)
 
 # -----------------------
+# Estimated LFD (NEW)
+# -----------------------
+st.divider()
+st.subheader("Estimated LFD (Last Free Day)")
+
+c1, c2, c3 = st.columns([1,1,2])
+with c1:
+    default_free_days = st.number_input("Default Free Days (calendar/business)", min_value=0, max_value=60, value=5, step=1)
+with c2:
+    business_days = st.checkbox("Use Business Days (skip Sat/Sun)", value=False)
+with c3:
+    free_map_file = st.file_uploader(
+        "Optional Free-Days mapping CSV (columns like: POD Port, Carrier Name, Free Days)",
+        type=["csv"], accept_multiple_files=False
+    )
+
+# build a flexible mapper if a CSV is provided
+def norm(s): 
+    return str(s).strip().lower() if pd.notna(s) else ""
+
+def get_mapper(df_map: pd.DataFrame):
+    # Accept flexible column names
+    cols = {c.lower(): c for c in df_map.columns}
+    def pick(*opts):
+        for o in opts:
+            if o.lower() in cols: 
+                return cols[o.lower()]
+        return None
+
+    col_pod = pick("POD Port", "POD", "Port of Discharge")
+    col_car = pick("Carrier Name", "Carrier")
+    col_days = pick("Free Days", "FreeDays", "free_days", "Days", "Demurrage Free Days")
+
+    if not col_days:
+        st.warning("Free-Days mapping CSV missing a 'Free Days' column. Ignoring mapping.")
+        return None, None, None
+
+    pod_car_days = {}
+    pod_days = {}
+    car_days = {}
+
+    for _, r in df_map.iterrows():
+        days = r.get(col_days, None)
+        try:
+            days = int(days)
+        except Exception:
+            continue
+        car = norm(r.get(col_car, "")) if col_car else ""
+        pod = norm(r.get(col_pod, "")) if col_pod else ""
+
+        if car and pod:
+            pod_car_days[(car, pod)] = days
+        elif pod:
+            pod_days[pod] = days
+        elif car:
+            car_days[car] = days
+
+    return pod_car_days, pod_days, car_days
+
+pod_car_days = pod_days = car_days = None
+if free_map_file is not None:
+    try:
+        df_map = pd.read_csv(free_map_file)
+        pod_car_days, pod_days, car_days = get_mapper(df_map)
+        st.success("Loaded Free-Days mapping.")
+    except Exception as e:
+        st.warning(f"Could not read mapping CSV: {e}")
+
+# assign free days
+df["_car_key"] = df["_Carrier"].map(norm)
+df["_pod_key"] = df["_POD Port"].map(norm)
+df["_FreeDays"] = default_free_days
+
+if pod_car_days or pod_days or car_days:
+    # combo override
+    if pod_car_days:
+        combo = (df["_car_key"] + "||" + df["_pod_key"]).map(
+            lambda k: pod_car_days.get(tuple(k.split("||", 1)), np.nan)
+        )
+        df["_FreeDays"] = np.where(~combo.isna(), combo, df["_FreeDays"])
+    # pod-only override
+    if pod_days:
+        pod_only = df["_pod_key"].map(lambda k: pod_days.get(k, np.nan))
+        df["_FreeDays"] = np.where(~pod_only.isna(), pod_only, df["_FreeDays"])
+    # carrier-only override
+    if car_days:
+        car_only = df["_car_key"].map(lambda k: car_days.get(k, np.nan))
+        df["_FreeDays"] = np.where(~car_only.isna(), car_only, df["_FreeDays"])
+
+# compute Estimated LFD from Container Discharge + FreeDays
+def add_days(discharge_ts: pd.Timestamp, n_days: int) -> pd.Timestamp:
+    if pd.isna(discharge_ts) or pd.isna(n_days):
+        return pd.NaT
+    n = int(n_days)
+    if business_days:
+        return discharge_ts + BDay(n)
+    else:
+        return discharge_ts + pd.to_timedelta(n, unit="D")
+
+df["_Estimated_LFD"] = [
+    add_days(d, n) for d, n in zip(discharge_dt, df["_FreeDays"])
+]
+
+# Slack vs LFD (in hours): positive = before LFD; negative = after LFD (late)
+df["_LFD_Slack_hours"] = (df["_Estimated_LFD"] - gate_out_dt).dt.total_seconds() / 3600.0
+df["_LFD_Late"] = df["_LFD_Slack_hours"] < 0
+
+# -----------------------
 # Filters
 # -----------------------
 st.subheader("Filters")
@@ -258,7 +365,7 @@ if carriers:
     df = df[df["_Carrier"].isin(carriers)]
 
 # -----------------------
-# Summaries
+# Duration Summaries (same as before)
 # -----------------------
 pol_summary = build_summary(df, ["_Carrier", "_POL Port"], "_POL_duration", "GateIn→ContainerLoaded (POL)", mode_round=mode_round)
 pod_dg_summary = build_summary(df, ["_Carrier", "_POD Port"], "_POD_dg_duration", "Discharge→GateOut (POD)", mode_round=mode_round)
@@ -287,12 +394,52 @@ pretty = results.rename(columns={
 for c in ["Average" + unit_suffix, "Mean" + unit_suffix, "Median" + unit_suffix, "Mode" + unit_suffix]:
     pretty[c] = pd.to_numeric(pretty[c], errors="coerce").round(2)
 
-st.subheader("Results")
+st.subheader("Milestone Gap Results")
 st.dataframe(pretty, use_container_width=True)
 
 st.download_button(
-    "Download results as CSV",
+    "Download milestone-gap results (CSV)",
     data=pretty.to_csv(index=False).encode("utf-8"),
     file_name="carrier_port_bottleneck_summary.csv",
+    mime="text/csv"
+)
+
+# -----------------------
+# LFD Risk Summary (NEW)
+# -----------------------
+st.subheader("Estimated LFD Risk (Carrier → POD)")
+
+def lfd_group_stats(g: pd.Series) -> pd.Series:
+    s = pd.to_numeric(g, errors="coerce").dropna()
+    if len(s) == 0:
+        return pd.Series({
+            "shipments": 0,
+            "late_count": 0,
+            "late_rate_%": np.nan,
+            "median_slack_hours": np.nan,
+            "avg_slack_hours": np.nan
+        })
+    late_count = (s < 0).sum()
+    return pd.Series({
+        "shipments": len(s),
+        "late_count": late_count,
+        "late_rate_%": round(100.0 * late_count / len(s), 2),
+        "median_slack_hours": round(s.median(), 2),
+        "avg_slack_hours": round(s.mean(), 2)
+    })
+
+lfd_summary = (
+    df.groupby(["_Carrier", "_POD Port"])["_LFD_Slack_hours"]
+      .apply(lfd_group_stats)
+      .reset_index()
+      .rename(columns={"_Carrier": "Carrier", "_POD Port": "POD Port"})
+)
+
+st.dataframe(lfd_summary, use_container_width=True)
+
+st.download_button(
+    "Download LFD summary (CSV)",
+    data=lfd_summary.to_csv(index=False).encode("utf-8"),
+    file_name="lfd_summary_by_carrier_pod.csv",
     mime="text/csv"
 )
