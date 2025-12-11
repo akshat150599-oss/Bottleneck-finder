@@ -1131,7 +1131,7 @@ with tab_lane:
     if lane_group.empty:
         st.info("No data to show by lane.")
     else:
-        # sort from highest to lowest % of shipments over free time on destination demurrage
+        # Sort from highest to lowest % of shipments over free time on destination demurrage
         lane_group = lane_group.sort_values("% Over Free Time – Dem POD", ascending=False)
         st.dataframe(lane_group, use_container_width=True)
 
