@@ -4,7 +4,7 @@ try:
 except Exception as e:
     raise RuntimeError("Streamlit is required. Try: pip install streamlit") from e
 
-# Backfill st.divider() for older Streamlit
+# Backfill st.divider() for older Streamlit versions
 if not hasattr(st, "divider"):
     def _divider():
         st.markdown("---")
@@ -23,7 +23,6 @@ from pandas.tseries.offsets import BDay
 WPI_CSV_URL = "https://msi.nga.mil/api/publications/world-port-index?output=csv"
 UNLOCODE_URL = "https://datahub.io/core/un-locode/r/code-list.csv"
 
-# Very small seed list (only used if both online sources fail)
 EMBEDDED_PORT_MASTER_CSV = """Port,Country,Latitude,Longitude
 Nhava Sheva (JNPT),IN,18.95,72.95
 Mundra,IN,22.75,69.70
@@ -39,12 +38,7 @@ Los Angeles,US,33.75,-118.26
 Long Beach,US,33.76,-118.21
 """
 
-# -----------------------
-# Helpers for online datasets
-# -----------------------
-
 def _http_get_csv(url: str, timeout=30):
-    """GET a CSV over HTTP and return a pandas DataFrame. Raise on failure."""
     r = requests.get(url, timeout=timeout)
     r.raise_for_status()
     data = r.text
@@ -94,12 +88,11 @@ def _dm_to_decimal(dm: str):
         if len(parts) != 2:
             return np.nan, np.nan
         latp, lonp = parts
-        # LAT
         deg = int(latp[:-3]); minutes = int(latp[-3:-1]); hemi = latp[-1]
         lat = deg + minutes/60.0
         if hemi in ('S', 's'):
             lat = -lat
-        # LON
+        lonp = parts[1]
         deg = int(lonp[:-3]); minutes = int(lonp[-3:-1]); hemi = lonp[-1]
         lon = deg + minutes/60.0
         if hemi in ('W', 'w'):
@@ -154,9 +147,7 @@ def get_port_master(prefer: str = 'WPI') -> pd.DataFrame:
 
 st.set_page_config(page_title="Ocean Bottleneck Analyzer", layout="wide")
 st.title("📦 Ocean Bottleneck Analyzer")
-st.caption("Identify bottlenecks, free-day risk (LFD/OFD), and inspect D&D hours")
-
-# Optional dependency checks (Excel engines)
+st.caption("Identify bottlenecks, free-day windows, and inspect Demurrage & Detention hours")
 
 def has_openpyxl() -> bool:
     try:
@@ -190,30 +181,25 @@ st.markdown(
     """
 ### What it computes
 **Durations**
-- **POL:** Gate In → Container Loaded  
-- **POD:** Discharge → Gate Out, Gate Out → Empty Return  
+- **Origin (POL) dwell:** Gate In → Container Loaded  
+- **Destination (POD) demurrage-like:** Discharge → Gate Out  
+- **Destination (POD) detention-like:** Gate Out → Empty Return  
 
 **Free Day windows**
 - **Estimated LFD (POD)** = Discharge + **Free Days (POD)**  
 - **Estimated OFD (POL)** = Gate In + **Free Days (POL)**  
-- Slack vs LFD/OFD shows how far you were from using up free days.  
+- Slack vs LFD/OFD shows how early/late you were vs free days.
 """
 )
 
 # -----------------------
 # File upload
 # -----------------------
-uploaded = st.file_uploader(
-    "Upload your movement/export file",
-    type=allowed_types,
-)
+uploaded = st.file_uploader("Upload your movement/export file", type=allowed_types)
 if not uploaded:
     st.stop()
 name = uploaded.name.lower()
 
-# -----------------------
-# Loaders
-# -----------------------
 @st.cache_data
 def load_csv(file):
     return pd.read_csv(file)
@@ -228,9 +214,9 @@ def excel_file(bytes_data: bytes, is_xlsx: bool):
         return pd.ExcelFile(BytesIO(bytes_data), engine=engine), engine
     except ImportError:
         if is_xlsx:
-            st.error("`.xlsx` needs **openpyxl**. Add to requirements.txt or run: `pip install openpyxl`")
+            st.error("`.xlsx` needs **openpyxl**.")
         else:
-            st.error("`.xls` needs **xlrd==1.2.0**. Add to requirements.txt or run: `pip install xlrd==1.2.0`")
+            st.error("`.xls` needs **xlrd==1.2.0**.")
         st.stop()
     except Exception as e:
         st.error(f"Failed to open Excel file: {e}")
@@ -297,7 +283,7 @@ else:
     if is_xlsx and not HAS_OPENPYXL:
         st.error("This environment can't read `.xlsx` yet. Install **openpyxl** or upload a CSV."); st.stop()
     if (not is_xlsx) and (not HAS_XLRD12):
-        st.error("This environment can't read legacy `.xls`. Install **xlrd==1.2.0** or upload a CSV."); st.stop()
+        st.error("This environment can't read legacy `.xls`. Install **xlrd==1.2.0` or upload a CSV."); st.stop()
     excel_bytes = load_excel_bytes(uploaded)
     xls, engine = excel_file(excel_bytes, is_xlsx=is_xlsx)
     sheet_name = st.selectbox("Choose sheet", xls.sheet_names, index=0)
@@ -336,16 +322,20 @@ with st.expander("Column Mapping", expanded=True):
 # Settings
 # -----------------------
 st.divider(); st.subheader("Settings")
-dayfirst = st.checkbox("Dates are day-first (DD/MM/YYYY)", value=True)
-unit = st.selectbox("Units", ["hours","minutes"], index=0)
+dayfirst = st.checkbox("Dates are day-first (DD/MM/YYYY)", value=True,
+                       help="If checked, timestamps are parsed as DD/MM/YY HH:MM:SS.")
+unit = st.selectbox("Units for raw duration columns", ["hours","minutes"], index=0,
+                    help="This affects the unit of the duration columns in tables; D&D logic always works in hours.")
 mode_round = st.slider("Mode rounding (units)", 0, 3, 1)
 neg_policy = st.selectbox(
     "Milestone durations: negatives",
     ["Keep (could be data issue)","Treat as NaN (drop from stats)"],
     index=1,
+    help="If a duration is negative (end < start), usually it is a data/timezone issue."
 )
 neg_tol = st.slider(
     "Slack tolerance (clip small negatives to 0)", 0.0, 6.0, 2.0, 0.5,
+    help="Applies to LFD/OFD slack only, to avoid flagging tiny negatives due to timestamp rounding."
 )
 
 # -----------------------
@@ -358,9 +348,9 @@ discharge_dt = to_datetime(df_raw[discharge_col], dayfirst=dayfirst)
 gate_out_dt = to_datetime(df_raw[gate_out_col], dayfirst=dayfirst)
 empty_return_dt = to_datetime(df_raw[empty_return_col], dayfirst=dayfirst)
 
-pol_gap = compute_duration_hours(gate_in_dt, container_loaded_dt)
-pod_dg_gap = compute_duration_hours(discharge_dt, gate_out_dt)
-pod_ge_gap = compute_duration_hours(gate_out_dt, empty_return_dt)
+pol_gap = compute_duration_hours(gate_in_dt, container_loaded_dt)       # origin demurrage base
+pod_dg_gap = compute_duration_hours(discharge_dt, gate_out_dt)          # dest demurrage base
+pod_ge_gap = compute_duration_hours(gate_out_dt, empty_return_dt)       # dest detention base
 
 if neg_policy == "Treat as NaN (drop from stats)":
     pol_gap = pol_gap.where(pol_gap >= 0)
@@ -453,12 +443,16 @@ def clip_small_negatives_to_zero(series: pd.Series, tol_hours: float) -> pd.Seri
 st.divider(); st.subheader("Estimated LFD (POD)")
 c1, c2, c3 = st.columns([1,1,2])
 with c1:
-    default_free_days_pod = st.number_input("Default POD Free Days", 0, 60, 5, 1)
+    default_free_days_pod = st.number_input("Default POD Free Days (Demurrage at Destination)", 0, 60, 5, 1,
+        help="Default free days at the destination port, if no port/carrier mapping applies.")
 with c2:
-    business_days_pod = st.checkbox("POD counts Business Days (skip Sat/Sun)?", value=False)
+    business_days_pod = st.checkbox("POD counts Business Days (skip Sat/Sun)?", value=False,
+        help="If checked, LFD adds business days only (Mon–Fri) before setting the cutoff at end-of-day.")
 with c3:
     fd_map_pod_file = st.file_uploader(
-        "Optional POD Free-Days mapping CSV (POD Port, Carrier Name, Free Days)", type=["csv"], key="podmap"
+        "Optional POD Free-Days mapping CSV (POD Port, Carrier Name, Free Days)",
+        type=["csv"], key="podmap",
+        help="Override default POD free days by carrier+port / port-only / carrier-only."
     )
 
 pod_mapper = None
@@ -484,12 +478,16 @@ st.caption(f"POD Free Days source breakdown: {pod_cov}")
 st.divider(); st.subheader("Estimated OFD (POL)")
 c1, c2, c3 = st.columns([1,1,2])
 with c1:
-    default_free_days_pol = st.number_input("Default POL Free Days (Origin)", 0, 60, 3, 1)
+    default_free_days_pol = st.number_input("Default POL Free Days (Demurrage at Origin)", 0, 60, 3, 1,
+        help="Default free days at the origin port, if no port/carrier mapping applies.")
 with c2:
-    business_days_pol = st.checkbox("POL counts Business Days (skip Sat/Sun)?", value=False)
+    business_days_pol = st.checkbox("POL counts Business Days (skip Sat/Sun)?", value=False,
+        help="If checked, OFD adds business days only (Mon–Fri) before setting the cutoff at end-of-day.")
 with c3:
     fd_map_pol_file = st.file_uploader(
-        "Optional POL Free-Days mapping CSV (POL Port, Carrier Name, Free Days)", type=["csv"], key="polmap"
+        "Optional POL Free-Days mapping CSV (POL Port, Carrier Name, Free Days)",
+        type=["csv"], key="polmap",
+        help="Override default POL free days by carrier+port / port-only / carrier-only."
     )
 
 pol_mapper = None
@@ -519,6 +517,7 @@ carriers = st.multiselect(
     "Carriers",
     sorted(df["_Carrier"].dropna().astype(str).unique().tolist()),
     default=None,
+    help="Filter downstream tables to only shipments with these carriers."
 )
 if carriers:
     df = df[df["_Carrier"].isin(carriers)]
@@ -615,10 +614,10 @@ with st.expander("Diagnostics (row-level export)"):
         "Carrier": df["_Carrier"],
         "POL Port": df["_POL Port"],
         "POD Port": df["_POD Port"],
-        "Gate In": gate_in_dt,
-        "Container Loaded": container_loaded_dt,
-        "Discharge": discharge_dt,
-        "Gate Out": gate_out_dt,
+        "Gate In": gate_in_dt.loc[df.index],
+        "Container Loaded": container_loaded_dt.loc[df.index],
+        "Discharge": discharge_dt.loc[df.index],
+        "Gate Out": gate_out_dt.loc[df.index],
         "Free Days (POD)": df["_FreeDays_POD"],
         "LFD (Estimated)": df["_Estimated_LFD"],
         "Slack vs LFD (hrs)": df["_LFD_Slack_hours"],
@@ -628,11 +627,11 @@ with st.expander("Diagnostics (row-level export)"):
         "Slack vs OFD (hrs)": df["_OFD_Slack_hours"],
         "FD Source (POL)": df["_FD_POL_source"],
     }
-    diag = pd.DataFrame(diag_cols)
+    diag = pd.DataFrame(diag_cols, index=df.index)
     neg_only = st.checkbox("Only rows with negative slack (POD or POL)", value=True)
     if neg_only:
         mask = (diag["Slack vs LFD (hrs)"] < 0) | (diag["Slack vs OFD (hrs)"] < 0)
-        diag_view = diag.loc[mask].copy()
+        diag_view = diag.loc[mask]
     else:
         diag_view = diag.copy()
     st.dataframe(diag_view, use_container_width=True)
@@ -643,68 +642,183 @@ with st.expander("Diagnostics (row-level export)"):
         mime="text/csv"
     )
 
-# ============================================
+# ============================================================
 # D&D HOURS UI – COMPLETED SHIPMENTS ONLY
-# ============================================
+# ============================================================
 
 st.divider()
 st.header("⏱ Demurrage & Detention Hours – Completed Shipments")
 
-# Over free days = slack < 0 (LFD at POD)
-dem_over_mask = df["_LFD_Slack_hours"] < 0
-dem_within_mask = ~dem_over_mask
+with st.expander("What do these terms mean?"):
+    st.markdown(
+        """
+- **Demurrage at POD (Destination)** – Time the container stays **inside the destination port**
+  after it is discharged from the vessel until it gates out.  
+  → Measured as **Discharge → Gate Out**, compared to **POD Free Days (LFD)**.
 
-hours_over_dem = (-df.loc[dem_over_mask, "_LFD_Slack_hours"]).clip(lower=0)
+- **Demurrage at POL (Origin)** – Time the container stays **inside the origin port**
+  from gate in until it is loaded on the vessel.  
+  → Measured as **Gate In → Container Loaded**, compared to **POL Free Days (OFD)**.
+
+- **Detention at POD (Destination equipment)** – Time the container stays **with you outside the port**
+  after it gates out from the terminal until you return it empty.  
+  → Measured as **Gate Out → Empty Return**, compared to a **Detention Free Days at POD**
+  value you choose below.
+
+- **Free Days** – Days during which you do **not** pay D&D. Time **beyond** free days is treated as
+  **“over free days”** in this app.
+        """
+    )
+
+# Align all series to the filtered df index
+idx = df.index
+
+LFD_slack = df["_LFD_Slack_hours"]
+OFD_slack = df["_OFD_Slack_hours"]
+pod_dg_dur = df["_POD_dg_duration"]
+pod_ge_dur = df["_POD_ge_duration"]
+
+discharge_f         = discharge_dt.loc[idx]
+gate_out_f          = gate_out_dt.loc[idx]
+empty_return_f      = empty_return_dt.loc[idx]
+gate_in_f           = gate_in_dt.loc[idx]
+container_loaded_f  = container_loaded_dt.loc[idx]
+
+# Convert detention to HOURS for calculations
+det_hours = pod_ge_dur if unit == "hours" else pod_ge_dur / 60.0
+
+# --- Detention free-days input ---
+st.subheader("Detention Free-Days Setting (POD)")
+
+det_free_pod_days = st.number_input(
+    "Detention Free Days at POD",
+    min_value=0, max_value=60, value=0, step=1,
+    help=(
+        "How many days after **Gate Out** you can keep the container before detention "
+        "counts as 'over free days'. This is applied uniformly in this view."
+    ),
+)
+
+det_free_hours = det_free_pod_days * 24.0
+
+if det_free_pod_days > 0:
+    det_over_mask = det_hours > det_free_hours
+    det_hours_over = pd.Series(
+        np.where(det_over_mask, det_hours - det_free_hours, 0.0),
+        index=idx,
+    )
+else:
+    det_over_mask = pd.Series(False, index=idx)
+    det_hours_over = pd.Series(0.0, index=idx)
+
+# --- Demurrage over/within masks & hours ---
+pod_dem_over_mask = LFD_slack < 0
+pod_dem_hours_over = (-LFD_slack[pod_dem_over_mask]).clip(lower=0)
+
+pol_dem_over_mask = OFD_slack < 0
+pol_dem_hours_over = (-OFD_slack[pol_dem_over_mask]).clip(lower=0)
 
 total_ship = len(df)
-count_over = dem_over_mask.sum()
-count_within = dem_within_mask.sum()
-pct_over = 100.0 * count_over / total_ship if total_ship else 0.0
 
-total_over_hours = hours_over_dem.sum()
-avg_over_hours = hours_over_dem.mean() if len(hours_over_dem) else 0.0
+# POD demurrage
+pod_count_over = pod_dem_over_mask.sum()
+pod_pct_over = 100.0 * pod_count_over / total_ship if total_ship else 0.0
+pod_total_over_hours = pod_dem_hours_over.sum()
+pod_avg_over_hours = pod_dem_hours_over.mean() if len(pod_dem_hours_over) else 0.0
 
-dem_unit = unit
-det_unit = unit
-total_det_hours = df["_POD_ge_duration"].sum()
-avg_det_hours = df["_POD_ge_duration"].mean()
+# POL demurrage
+pol_count_over = pol_dem_over_mask.sum()
+pol_pct_over = 100.0 * pol_count_over / total_ship if total_ship else 0.0
+pol_total_over_hours = pol_dem_hours_over.sum()
+pol_avg_over_hours = pol_dem_hours_over.mean() if len(pol_dem_hours_over) else 0.0
+
+# Detention
+det_count_over = det_over_mask.sum()
+det_pct_over = 100.0 * det_count_over / total_ship if total_ship else 0.0
+det_total_over_hours = det_hours_over.sum()
+det_avg_over_hours = det_hours_over[det_over_mask].mean() if det_count_over else 0.0
+
+# Raw totals (always expressed in HOURS)
+dem_pod_hours_series = pod_dg_gap.loc[idx]          # hours
+dem_pol_hours_series = pol_gap.loc[idx]             # hours
+det_hours_series     = det_hours
+
+total_dem_pod_hours = dem_pod_hours_series.sum()
+avg_dem_pod_hours   = dem_pod_hours_series.mean()
+
+total_dem_pol_hours = dem_pol_hours_series.sum()
+avg_dem_pol_hours   = dem_pol_hours_series.mean()
+
+total_det_hours = det_hours_series.sum()
+avg_det_hours   = det_hours_series.mean()
 
 # --- OVERVIEW KPIs ---
-st.subheader("Overview – Within vs Over Free Days (Demurrage at POD)")
+st.subheader("Overview – Within vs Over Free Days")
 
-col1, col2, col3, col4 = st.columns(4)
-with col1:
-    st.metric("Total Completed Shipments", f"{total_ship:,}")
-with col2:
-    st.metric("Shipments Over Free Days (Demurrage)", f"{count_over:,}")
-with col3:
-    st.metric("% Shipments Over Free Days", f"{pct_over:.1f}%")
-with col4:
+row1 = st.columns(4)
+with row1[0]:
     st.metric(
-        "Avg Hours Over (overage only)",
-        f"{avg_over_hours:,.1f} hrs" if count_over else "0.0 hrs"
+        "Total Completed Shipments",
+        f"{total_ship:,}",
+        help="Number of containers in this filtered dataset (all completed).",
+    )
+with row1[1]:
+    st.metric(
+        "Shipments Over Free Days – Demurrage at POD",
+        f"{pod_count_over:,}",
+    )
+with row1[2]:
+    st.metric(
+        "Shipments Over Free Days – Demurrage at POL",
+        f"{pol_count_over:,}",
+    )
+with row1[3]:
+    st.metric(
+        "Shipments Over Free Days – Detention at POD",
+        f"{det_count_over:,}",
+    )
+
+row2 = st.columns(4)
+with row2[0]:
+    st.metric(
+        "% Over Free Days – Demurrage at POD",
+        f"{pod_pct_over:.1f}%",
+    )
+with row2[1]:
+    st.metric(
+        "% Over Free Days – Demurrage at POL",
+        f"{pol_pct_over:.1f}%",
+    )
+with row2[2]:
+    st.metric(
+        "% Over Free Days – Detention at POD",
+        f"{det_pct_over:.1f}%",
+    )
+with row2[3]:
+    st.metric(
+        "Avg Hours Over (all over cases)",
+        f"{(pod_avg_over_hours + pol_avg_over_hours + det_avg_over_hours):.1f} hrs",
+        help=(
+            "Simple average of hours over free days across: "
+            "Demurrage at POD, Demurrage at POL, and Detention at POD."
+        ),
     )
 
 st.caption(
-    "Over Free Days is determined using slack vs LFD (Last Free Day) at POD. "
-    "This view assumes all shipments are completed."
+    "Demurrage free days at POL/POD come from your mapping above. "
+    "Detention free days at POD use the single value you entered here."
 )
 
-colA, colB = st.columns(2)
+colA, colB, colC = st.columns(3)
 with colA:
-    total_dem_hours = df["_POD_dg_duration"].sum()
-    avg_dem_hours = df["_POD_dg_duration"].mean()
-    st.metric(f"Total Demurrage ({dem_unit})", f"{total_dem_hours:,.0f}")
-    st.metric(
-        f"Avg Demurrage per Shipment ({dem_unit})",
-        f"{avg_dem_hours:,.1f}" if not np.isnan(avg_dem_hours) else "–"
-    )
+    st.metric("Total Demurrage Hours at POD (Discharge→Gate Out)", f"{total_dem_pod_hours:,.0f}")
+    st.metric("Avg Demurrage per Shipment at POD (hrs)", f"{avg_dem_pod_hours:,.1f}" if not np.isnan(avg_dem_pod_hours) else "–")
 with colB:
-    st.metric(f"Total Detention ({det_unit})", f"{total_det_hours:,.0f}")
-    st.metric(
-        f"Avg Detention per Shipment ({det_unit})",
-        f"{avg_det_hours:,.1f}" if not np.isnan(avg_det_hours) else "–"
-    )
+    st.metric("Total Demurrage Hours at POL (Gate In→Loaded)", f"{total_dem_pol_hours:,.0f}")
+    st.metric("Avg Demurrage per Shipment at POL (hrs)", f"{avg_dem_pol_hours:,.1f}" if not np.isnan(avg_dem_pol_hours) else "–")
+with colC:
+    st.metric("Total Detention Hours at POD (Gate Out→Empty Return)", f"{total_det_hours:,.0f}")
+    st.metric("Avg Detention per Shipment at POD (hrs)", f"{avg_det_hours:,.1f}" if not np.isnan(avg_det_hours) else "–")
 
 st.divider()
 
@@ -715,103 +829,157 @@ tab_overview, tab_port_carrier, tab_lane, tab_shipments = st.tabs(
 
 # 1) CHARTS TAB
 with tab_overview:
-    st.subheader("D&D Hours Distribution")
+    st.subheader("D&D Hours Distribution (hours only – no charges)")
 
-    dem_by_pod = (
-        df.groupby("_POD Port")["_POD_dg_duration"]
-          .sum()
-          .sort_values(ascending=False)
-          .head(10)
-          .rename("Total Demurrage")
-          .reset_index()
+    # Demurrage at POD by POD Port
+    dem_pod_by_pod = (
+        pd.DataFrame({"_POD Port": df["_POD Port"], "DemHoursPOD": dem_pod_hours_series})
+        .groupby("_POD Port")["DemHoursPOD"]
+        .sum()
+        .sort_values(ascending=False)
+        .head(10)
+        .reset_index()
     )
 
-    if not dem_by_pod.empty:
-        st.markdown(f"**Top 10 POD Ports by Demurrage ({dem_unit})**")
-        st.bar_chart(dem_by_pod.set_index("_POD Port")["Total Demurrage"])
+    if not dem_pod_by_pod.empty:
+        st.markdown("**Top 10 POD Ports by Demurrage Hours (Destination)**")
+        st.bar_chart(dem_pod_by_pod.set_index("_POD Port")["DemHoursPOD"])
     else:
-        st.info("No demurrage data available to plot by POD Port.")
+        st.info("No demurrage-at-POD data to plot by POD Port.")
 
     st.markdown("---")
 
+    # Detention at POD by POD Port
     det_by_pod = (
-        df.groupby("_POD Port")["_POD_ge_duration"]
-          .sum()
-          .sort_values(ascending=False)
-          .head(10)
-          .rename("Total Detention")
-          .reset_index()
+        pd.DataFrame({"_POD Port": df["_POD Port"], "DetHoursPOD": det_hours_series})
+        .groupby("_POD Port")["DetHoursPOD"]
+        .sum()
+        .sort_values(ascending=False)
+        .head(10)
+        .reset_index()
     )
 
     if not det_by_pod.empty:
-        st.markdown(f"**Top 10 POD Ports by Detention ({det_unit})**")
-        st.bar_chart(det_by_pod.set_index("_POD Port")["Total Detention"])
+        st.markdown("**Top 10 POD Ports by Detention Hours (Equipment)**")
+        st.bar_chart(det_by_pod.set_index("_POD Port")["DetHoursPOD"])
     else:
-        st.info("No detention data available to plot by POD Port.")
+        st.info("No detention-at-POD data to plot by POD Port.")
 
 # 2) BY PORT & CARRIER TAB
 with tab_port_carrier:
-    st.subheader("Demurrage – Over vs Within Free Days (Carrier → POD)")
+    st.subheader("Demurrage at POD – Over vs Within Free Days (Carrier → POD)")
+    st.caption("Destination port side: Discharge → Gate Out, using POD Free Days (LFD).")
 
-    def agg_demurrage_group(g: pd.DataFrame) -> pd.Series:
+    def agg_demurrage_pod_group(g: pd.DataFrame) -> pd.Series:
         shipments = len(g)
         over = (g["_LFD_Slack_hours"] < 0).sum()
         pct_over = 100.0 * over / shipments if shipments else np.nan
         hours_over = (-g.loc[g["_LFD_Slack_hours"] < 0, "_LFD_Slack_hours"]).clip(lower=0)
         avg_hours_over = hours_over.mean() if len(hours_over) else 0.0
-        avg_dem = g["_POD_dg_duration"].mean()
-        med_dem = g["_POD_dg_duration"].median()
+        dem_vals = pod_dg_gap.loc[g.index]  # hours
+        avg_dem = dem_vals.mean()
+        med_dem = dem_vals.median()
         return pd.Series({
             "Shipments": shipments,
             "Shipments Over Free Days": over,
             "% Over Free Days": pct_over,
-            f"Avg Demurrage ({dem_unit})": avg_dem,
-            f"Median Demurrage ({dem_unit})": med_dem,
+            "Avg Demurrage (hrs)": avg_dem,
+            "Median Demurrage (hrs)": med_dem,
             "Avg Hours Over (demurrage)": avg_hours_over,
         })
 
-    dem_group = (
+    dem_pod_group = (
         df.groupby(["_POD Port", "_Carrier"])
-          .apply(agg_demurrage_group)
+          .apply(agg_demurrage_pod_group)
           .reset_index()
           .rename(columns={"_POD Port": "POD Port", "_Carrier": "Carrier"})
     )
 
-    num_cols = [
-        "% Over Free Days",
-        f"Avg Demurrage ({dem_unit})",
-        f"Median Demurrage ({dem_unit})",
-        "Avg Hours Over (demurrage)",
-    ]
+    num_cols = ["% Over Free Days","Avg Demurrage (hrs)","Median Demurrage (hrs)","Avg Hours Over (demurrage)"]
     for c in num_cols:
-        dem_group[c] = pd.to_numeric(dem_group[c], errors="coerce").round(2)
+        dem_pod_group[c] = pd.to_numeric(dem_pod_group[c], errors="coerce").round(2)
 
-    if dem_group.empty:
-        st.info("No data to show for Demurrage by POD Port & Carrier.")
+    if dem_pod_group.empty:
+        st.info("No data to show for Demurrage at POD by POD Port & Carrier.")
     else:
-        dem_group = dem_group.sort_values("% Over Free Days", ascending=False)
-        st.dataframe(dem_group, use_container_width=True)
+        dem_pod_group = dem_pod_group.sort_values("% Over Free Days", ascending=False)
+        st.dataframe(dem_pod_group, use_container_width=True)
 
     st.download_button(
-        "Download: Demurrage by POD Port & Carrier (CSV)",
-        data=dem_group.to_csv(index=False).encode("utf-8"),
-        file_name="demurrage_by_pod_carrier.csv",
+        "Download: Demurrage at POD by POD Port & Carrier (CSV)",
+        data=dem_pod_group.to_csv(index=False).encode("utf-8"),
+        file_name="demurrage_pod_by_pod_carrier.csv",
         mime="text/csv",
     )
 
     st.markdown("---")
-    st.subheader("Detention – Summary by POD Port & Carrier")
+    st.subheader("Demurrage at POL – Over vs Within Free Days (Carrier → POL)")
+    st.caption("Origin port side: Gate In → Container Loaded, using POL Free Days (OFD).")
+
+    def agg_demurrage_pol_group(g: pd.DataFrame) -> pd.Series:
+        shipments = len(g)
+        over = (g["_OFD_Slack_hours"] < 0).sum()
+        pct_over = 100.0 * over / shipments if shipments else np.nan
+        hours_over = (-g.loc[g["_OFD_Slack_hours"] < 0, "_OFD_Slack_hours"]).clip(lower=0)
+        avg_hours_over = hours_over.mean() if len(hours_over) else 0.0
+        dem_vals = pol_gap.loc[g.index]  # hours
+        avg_dem = dem_vals.mean()
+        med_dem = dem_vals.median()
+        return pd.Series({
+            "Shipments": shipments,
+            "Shipments Over Free Days": over,
+            "% Over Free Days": pct_over,
+            "Avg Demurrage (hrs)": avg_dem,
+            "Median Demurrage (hrs)": med_dem,
+            "Avg Hours Over (demurrage)": avg_hours_over,
+        })
+
+    dem_pol_group = (
+        df.groupby(["_POL Port", "_Carrier"])
+          .apply(agg_demurrage_pol_group)
+          .reset_index()
+          .rename(columns={"_POL Port": "POL Port", "_Carrier": "Carrier"})
+    )
+
+    for c in num_cols:
+        dem_pol_group[c] = pd.to_numeric(dem_pol_group[c], errors="coerce").round(2)
+
+    if dem_pol_group.empty:
+        st.info("No data to show for Demurrage at POL by POL Port & Carrier.")
+    else:
+        dem_pol_group = dem_pol_group.sort_values("% Over Free Days", ascending=False)
+        st.dataframe(dem_pol_group, use_container_width=True)
+
+    st.download_button(
+        "Download: Demurrage at POL by POL Port & Carrier (CSV)",
+        data=dem_pol_group.to_csv(index=False).encode("utf-8"),
+        file_name="demurrage_pol_by_pol_carrier.csv",
+        mime="text/csv",
+    )
+
+    st.markdown("---")
+    st.subheader("Detention at POD – Summary by POD Port & Carrier")
+    st.caption(
+        "Equipment time outside the terminal: Gate Out → Empty Return. "
+        "Free-days threshold for 'over' uses the detention free-days setting above."
+    )
 
     def agg_detention_group(g: pd.DataFrame) -> pd.Series:
         shipments = len(g)
-        avg_det = g["_POD_ge_duration"].mean()
-        med_det = g["_POD_ge_duration"].median()
-        max_det = g["_POD_ge_duration"].max()
+        det_vals = det_hours_series.loc[g.index]
+        avg_det = det_vals.mean()
+        med_det = det_vals.median()
+        max_det = det_vals.max()
+        local_det_over = det_over_mask.loc[g.index]
+        over = local_det_over.sum()
+        pct_over = 100.0 * over / shipments if shipments else np.nan
         return pd.Series({
             "Shipments": shipments,
-            f"Avg Detention ({det_unit})": avg_det,
-            f"Median Detention ({det_unit})": med_det,
-            f"Max Detention ({det_unit})": max_det,
+            "Shipments Over Free Days": over,
+            "% Over Free Days": pct_over,
+            "Avg Detention (hrs)": avg_det,
+            "Median Detention (hrs)": med_det,
+            "Max Detention (hrs)": max_det,
         })
 
     det_group = (
@@ -821,41 +989,64 @@ with tab_port_carrier:
           .rename(columns={"_POD Port": "POD Port", "_Carrier": "Carrier"})
     )
 
-    for c in [f"Avg Detention ({det_unit})", f"Median Detention ({det_unit})", f"Max Detention ({det_unit})"]:
+    for c in ["% Over Free Days","Avg Detention (hrs)","Median Detention (hrs)","Max Detention (hrs)"]:
         det_group[c] = pd.to_numeric(det_group[c], errors="coerce").round(2)
 
     if det_group.empty:
-        st.info("No data to show for Detention by POD Port & Carrier.")
+        st.info("No data to show for Detention at POD by POD Port & Carrier.")
     else:
-        det_group = det_group.sort_values(f"Avg Detention ({det_unit})", ascending=False)
+        det_group = det_group.sort_values("Avg Detention (hrs)", ascending=False)
         st.dataframe(det_group, use_container_width=True)
 
     st.download_button(
-        "Download: Detention by POD Port & Carrier (CSV)",
+        "Download: Detention at POD by POD Port & Carrier (CSV)",
         data=det_group.to_csv(index=False).encode("utf-8"),
-        file_name="detention_by_pod_carrier.csv",
+        file_name="detention_pod_by_pod_carrier.csv",
         mime="text/csv",
     )
 
 # 3) BY LANE TAB
 with tab_lane:
     st.subheader("D&D Hours by Lane (POL → POD) – Completed Shipments")
+    st.caption(
+        "Each row is a POL→POD pair. Demurrage at POL uses OFD slack; demurrage at POD uses LFD slack; "
+        "detention at POD uses the detention free-days setting above."
+    )
 
     def agg_lane_group(g: pd.DataFrame) -> pd.Series:
         shipments = len(g)
-        over = (g["_LFD_Slack_hours"] < 0).sum()
-        pct_over = 100.0 * over / shipments if shipments else np.nan
-        hours_over = (-g.loc[g["_LFD_Slack_hours"] < 0, "_LFD_Slack_hours"]).clip(lower=0)
-        avg_hours_over = hours_over.mean() if len(hours_over) else 0.0
-        avg_dem = g["_POD_dg_duration"].mean()
-        avg_det = g["_POD_ge_duration"].mean()
+        # dem POD
+        over_pod = (g["_LFD_Slack_hours"] < 0).sum()
+        pct_over_pod = 100.0 * over_pod / shipments if shipments else np.nan
+        hours_over_pod = (-g.loc[g["_LFD_Slack_hours"] < 0, "_LFD_Slack_hours"]).clip(lower=0)
+        avg_hours_over_pod = hours_over_pod.mean() if len(hours_over_pod) else 0.0
+
+        # dem POL
+        over_pol = (g["_OFD_Slack_hours"] < 0).sum()
+        pct_over_pol = 100.0 * over_pol / shipments if shipments else np.nan
+        hours_over_pol = (-g.loc[g["_OFD_Slack_hours"] < 0, "_OFD_Slack_hours"]).clip(lower=0)
+        avg_hours_over_pol = hours_over_pol.mean() if len(hours_over_pol) else 0.0
+
+        # detention
+        det_vals = det_hours_series.loc[g.index]
+        avg_det = det_vals.mean()
+        local_det_over = det_over_mask.loc[g.index]
+        over_det = local_det_over.sum()
+        pct_over_det = 100.0 * over_det / shipments if shipments else np.nan
+
+        dem_pod_vals = dem_pod_hours_series.loc[g.index]
+        dem_pol_vals = dem_pol_hours_series.loc[g.index]
+
         return pd.Series({
             "Shipments": shipments,
-            "Shipments Over Free Days": over,
-            "% Over Free Days": pct_over,
-            f"Avg Demurrage ({dem_unit})": avg_dem,
-            f"Avg Detention ({det_unit})": avg_det,
-            "Avg Hours Over (demurrage)": avg_hours_over,
+            "% Over Free Days – Dem POD": pct_over_pod,
+            "% Over Free Days – Dem POL": pct_over_pol,
+            "% Over Free Days – Det POD": pct_over_det,
+            "Avg Demurrage POD (hrs)": dem_pod_vals.mean(),
+            "Avg Demurrage POL (hrs)": dem_pol_vals.mean(),
+            "Avg Detention POD (hrs)": avg_det,
+            "Avg Hours Over Dem POD (hrs)": avg_hours_over_pod,
+            "Avg Hours Over Dem POL (hrs)": avg_hours_over_pol,
         })
 
     lane_group = (
@@ -866,17 +1057,21 @@ with tab_lane:
     )
 
     for c in [
-        "% Over Free Days",
-        f"Avg Demurrage ({dem_unit})",
-        f"Avg Detention ({det_unit})",
-        "Avg Hours Over (demurrage)",
+        "% Over Free Days – Dem POD",
+        "% Over Free Days – Dem POL",
+        "% Over Free Days – Det POD",
+        "Avg Demurrage POD (hrs)",
+        "Avg Demurrage POL (hrs)",
+        "Avg Detention POD (hrs)",
+        "Avg Hours Over Dem POD (hrs)",
+        "Avg Hours Over Dem POL (hrs)",
     ]:
         lane_group[c] = pd.to_numeric(lane_group[c], errors="coerce").round(2)
 
     if lane_group.empty:
         st.info("No data to show by lane.")
     else:
-        lane_group = lane_group.sort_values("% Over Free Days", ascending=False)
+        lane_group = lane_group.sort_values("% Over Free Days – Dem POD", ascending=False)
         st.dataframe(lane_group, use_container_width=True)
 
     st.download_button(
@@ -888,36 +1083,59 @@ with tab_lane:
 
 # 4) SHIPMENT EXPLORER TAB
 with tab_shipments:
-    st.subheader("Shipment Explorer – Over vs Within Free Days (Demurrage at POD)")
+    st.subheader("Shipment Explorer – Demurrage & Detention Status per Container")
 
-    only_over = st.checkbox("Show only shipments over free days (demurrage)", value=True)
+    only_over_any = st.checkbox(
+        "Show only shipments over free days on **any** side",
+        value=True,
+        help="If checked, keep only rows where demurrage at POD, demurrage at POL, or detention at POD is over free days."
+    )
+
+    dem_pod_status = np.where(LFD_slack < 0, "Over Free Days", "Within Free Days")
+    dem_pol_status = np.where(OFD_slack < 0, "Over Free Days", "Within Free Days")
+    det_status     = np.where(det_over_mask, "Over Free Days", "Within Free Days")
+
+    dem_pod_hours = dem_pod_hours_series
+    dem_pol_hours = dem_pol_hours_series
 
     diag_dd = pd.DataFrame({
         "Carrier": df["_Carrier"],
         "POL Port": df["_POL Port"],
         "POD Port": df["_POD Port"],
-        "Discharge": discharge_dt,
-        "Gate Out": gate_out_dt,
-        "Empty Return": empty_return_dt,
-        f"Demurrage ({dem_unit}) Discharge→Gate Out": df["_POD_dg_duration"],
-        f"Detention ({det_unit}) Gate Out→Empty Return": df["_POD_ge_duration"],
-        "Free Days (POD)": df["_FreeDays_POD"],
-        "Slack vs LFD (hrs)": df["_LFD_Slack_hours"],
-    })
+        "Gate In (POL)": gate_in_f,
+        "Container Loaded (POL)": container_loaded_f,
+        "Discharge (POD)": discharge_f,
+        "Gate Out (POD)": gate_out_f,
+        "Empty Return (POD)": empty_return_f,
+        "Demurrage Hours at POL (Gate In→Loaded)": dem_pol_hours,
+        "Demurrage Hours at POD (Discharge→Gate Out)": dem_pod_hours,
+        "Detention Hours at POD (Gate Out→Empty Return)": det_hours_series,
+        "Free Days POL (Origin)": df["_FreeDays_POL"],
+        "Free Days POD (Destination)": df["_FreeDays_POD"],
+        "Slack vs OFD at POL (hrs)": OFD_slack,
+        "Slack vs LFD at POD (hrs)": LFD_slack,
+        "Demurrage Status at POL": dem_pol_status,
+        "Demurrage Status at POD": dem_pod_status,
+        "Detention Status at POD": det_status,
+        "Detention Hours Over Free Days at POD": det_hours_over,
+    }, index=idx)
 
-    diag_dd["Demurrage Status"] = np.where(
-        diag_dd["Slack vs LFD (hrs)"] < 0,
-        "Over Free Days",
-        "Within Free Days"
-    )
-
-    if only_over:
-        diag_view = diag_dd[diag_dd["Demurrage Status"] == "Over Free Days"].copy()
+    if only_over_any:
+        mask_over_any = (
+            (diag_dd["Demurrage Status at POL"] == "Over Free Days") |
+            (diag_dd["Demurrage Status at POD"] == "Over Free Days") |
+            (diag_dd["Detention Status at POD"] == "Over Free Days")
+        )
+        diag_view = diag_dd.loc[mask_over_any].copy()
     else:
         diag_view = diag_dd.copy()
 
-    st.dataframe(diag_view, use_container_width=True)
+    st.caption(
+        "Demurrage free days at POL/POD use the mapping you configured earlier. "
+        "Detention free days at POD use the single number you entered at the top of this section."
+    )
 
+    st.dataframe(diag_view, use_container_width=True)
     st.download_button(
         "Download: Shipment-level D&D Hours (CSV)",
         data=diag_view.to_csv(index=False).encode("utf-8"),
