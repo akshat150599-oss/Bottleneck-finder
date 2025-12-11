@@ -1131,8 +1131,7 @@ with tab_lane:
     if lane_group.empty:
         st.info("No data to show by lane.")
     else:
-        lane_group = lane_group.sort_values("% Over Free Time – Dem POD", descending=True if "descending" else False)
-        # Correction: sort_values ascending=False (Streamlit doesn't care)
+        # sort from highest to lowest % of shipments over free time on destination demurrage
         lane_group = lane_group.sort_values("% Over Free Time – Dem POD", ascending=False)
         st.dataframe(lane_group, use_container_width=True)
 
