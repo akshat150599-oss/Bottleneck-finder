@@ -3,6 +3,7 @@
 # - Demurrage at POD (Discharge -> Gate Out)
 # - Demurrage at POL (Gate In -> Container Loaded)
 # - Detention at POD (Gate Out -> Empty Return)
+# - Free days in DAYS, durations in DAYS (display), slack in HOURS
 # - Slack vs free time (hrs, + = overtime) at POD & POL
 # =============================================================
 
@@ -193,18 +194,6 @@ def apply_free_days(df_in: pd.DataFrame, car_col: str, port_col: str,
 
     return pd.to_numeric(days, errors="coerce"), pd.Series(source, index=df_in.index)
 
-def summarize_duration(series: pd.Series):
-    s = pd.to_numeric(series, errors='coerce').dropna()
-    if len(s) == 0:
-        return pd.Series({"Shipments": 0, "Avg": np.nan, "Median": np.nan, "P95": np.nan, "Max": np.nan})
-    return pd.Series({
-        "Shipments": len(s),
-        "Avg": s.mean(),
-        "Median": s.median(),
-        "P95": s.quantile(0.95),
-        "Max": s.max(),
-    })
-
 def slack_group_stats(slack: pd.Series) -> pd.Series:
     s = pd.to_numeric(slack, errors='coerce').dropna()
     if len(s) == 0:
@@ -240,19 +229,29 @@ st.markdown(
     """
 This app focuses **only on Demurrage & Detention time**, *not* on charges.
 
-**Base durations (shown in _days_):**
+**Base durations (we show them in _days_):**
 
 - **Demurrage at POD** = `Discharge` → `Gate Out`  
 - **Demurrage at POL** = `Gate In` → `Container Loaded`  
 - **Detention at POD** = `Gate Out` → `Empty Return`  
 
-We convert these durations from hours to **days** for display.
+All three are first computed in hours, then converted to **days** for display.
 
-**Slack (shown in _hours_, + = overtime):**
+**Slack (in _hours_, + = overtime)**  
 
-- **Slack vs LFD (Dem POD)** = `(Demurrage at POD hours) − (Free Days at POD × 24)`  
-- **Slack vs OFD (Dem POL)** = `(Demurrage at POL hours) − (Free Days at POL × 24)`  
-- **Detention Slack at POD** = `(Detention at POD hours) − (Detention Free Days at POD × 24)`  
+We treat free days as the *allowed* time and compare the actual time:
+
+- **Slack vs LFD (Dem POD)**  
+  = `Demurrage at POD (hours)` − `POD Free Days × 24`  
+
+- **Slack vs OFD (Dem POL)**  
+  = `Demurrage at POL (hours)` − `POL Free Days × 24`  
+
+- **Detention Slack at POD**  
+  = `Detention at POD (hours)` − `Detention Free Days at POD × 24`  
+
+> Positive slack = **Over Free Days**  
+> Zero or negative slack = **Within Free Days**
 """
 )
 
@@ -389,7 +388,7 @@ dayfirst = st.checkbox(
     help="Tick if your timestamps are in DD/MM/YYYY format.",
 )
 
-unit_factor = 1.0 / 24.0  # show durations in days
+unit_factor = 1.0 / 24.0  # display durations in days
 unit_label = "days"
 
 neg_policy = st.selectbox(
@@ -484,7 +483,7 @@ df["_FreeDays_POD"], df["_FD_POD_source"] = apply_free_days(
 )
 df["_Estimated_LFD"] = add_days_eod_vector(discharge_dt, df["_FreeDays_POD"], business_days_pod)
 
-# NEW: Slack vs LFD = Dem POD hours − (free days × 24)
+# Slack vs LFD = Dem POD hours − (free days × 24)
 df["_Slack_LFD_hours"] = df["_Dem_POD_hours"] - df["_FreeDays_POD"] * 24.0
 
 pod_cov = df["_FD_POD_source"].value_counts(dropna=False).to_dict()
@@ -535,7 +534,7 @@ df["_FreeDays_POL"], df["_FD_POL_source"] = apply_free_days(
 )
 df["_Estimated_OFD"] = add_days_eod_vector(gate_in_dt, df["_FreeDays_POL"], business_days_pol)
 
-# NEW: Slack vs OFD = Dem POL hours − (free days × 24)
+# Slack vs OFD = Dem POL hours − (free days × 24)
 df["_Slack_OFD_hours"] = df["_Dem_POL_hours"] - df["_FreeDays_POL"] * 24.0
 
 pol_cov = df["_FD_POL_source"].value_counts(dropna=False).to_dict()
@@ -580,7 +579,7 @@ df["_Det_FreeDays_POD"], df["_FD_DET_source"] = apply_free_days(
     df, "_Carrier", "_POD Port", default_free_days_det, det_mapper, "POD"
 )
 
-# NEW: Detention Slack = Det hours − (Det free days × 24)
+# Detention Slack = Det hours − (Det free days × 24)
 df["_Det_Slack_hours"] = df["_Det_POD_hours"] - df["_Det_FreeDays_POD"] * 24.0
 
 det_cov = df["_FD_DET_source"].value_counts(dropna=False).to_dict()
@@ -631,6 +630,11 @@ shipment_ids = df.loc[idx, "_ShipmentID"]
 carrier_vals = df.loc[idx, "_Carrier"]
 pol_vals = df.loc[idx, "_POL Port"]
 pod_vals = df.loc[idx, "_POD Port"]
+
+# Shipment-level status flags (within / over free days)
+dem_pod_status = np.where(slack_lfd > 0, "Over Free Days", "Within Free Days")
+dem_pol_status = np.where(slack_ofd > 0, "Over Free Days", "Within Free Days")
+det_pod_status = np.where(slack_det > 0, "Over Free Days", "Within Free Days")
 
 # -------------------------------------------------------------
 # Tabs
@@ -900,6 +904,9 @@ with tab_ship:
             "Slack vs OFD (hrs, + = over)": slack_ofd,
             "Slack vs LFD (hrs, + = over)": slack_lfd,
             "Detention Slack at POD (hrs, + = over)": slack_det,
+            "Demurrage Status at POL": dem_pol_status,
+            "Demurrage Status at POD": dem_pod_status,
+            "Detention Status at POD": det_pod_status,
         }
     )
 
@@ -930,6 +937,9 @@ with tab_ship:
         "Slack vs OFD (hrs, + = over)",
         "Slack vs LFD (hrs, + = over)",
         "Detention Slack at POD (hrs, + = over)",
+        "Demurrage Status at POL",
+        "Demurrage Status at POD",
+        "Detention Status at POD",
     ]
 
     st.dataframe(explorer_df[show_cols], use_container_width=True)
