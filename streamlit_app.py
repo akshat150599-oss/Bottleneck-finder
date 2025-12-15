@@ -236,32 +236,35 @@ support_msg.append("✅ .xlsx (openpyxl)" if HAS_OPENPYXL else "❌ .xlsx (insta
 support_msg.append("✅ .xls (xlrd==1.2.0)" if HAS_XLRD12 else "❌ .xls (install `xlrd==1.2.0`)")
 st.info("File support in this environment: " + " | ".join(support_msg))
 
-allowed_types = ["csv"]
-if HAS_OPENPYXL:
-    allowed_types.append("xlsx")
-if HAS_XLRD12:
-    allowed_types.append("xls")
-
 st.markdown(
     """
 This app focuses **only on Demurrage & Detention time**, *not* on charges.
 
-**Definitions (hours):**
+**Base durations (shown in _days_):**
 
 - **Demurrage at POD** = `Discharge` → `Gate Out`  
 - **Demurrage at POL** = `Gate In` → `Container Loaded`  
 - **Detention at POD** = `Gate Out` → `Empty Return`  
 
-**Slack (all in hours, + = overtime)**  
-- **Slack vs LFD (Dem POD)** = `Gate Out` − `Estimated LFD`  
-- **Slack vs OFD (Dem POL)** = `Container Loaded` − `Estimated OFD`  
-- **Detention Slack at POD** = `Detention Hours` − `Detention Free Time`
+We convert these durations from hours to **days** for display.
+
+**Slack (shown in _hours_, + = overtime):**
+
+- **Slack vs LFD (Dem POD)** = `(Demurrage at POD hours) − (Free Days at POD × 24)`  
+- **Slack vs OFD (Dem POL)** = `(Demurrage at POL hours) − (Free Days at POL × 24)`  
+- **Detention Slack at POD** = `(Detention at POD hours) − (Detention Free Days at POD × 24)`  
 """
 )
 
 # -------------------------------------------------------------
 # File Upload
 # -------------------------------------------------------------
+allowed_types = ["csv"]
+if HAS_OPENPYXL:
+    allowed_types.append("xlsx")
+if HAS_XLRD12:
+    allowed_types.append("xls")
+
 uploaded = st.file_uploader(
     "Upload your shipment file",
     type=allowed_types,
@@ -291,7 +294,7 @@ else:
 df_raw = normalize_columns(df_raw)
 
 # -------------------------------------------------------------
-# Column Mapping (now includes Shipment ID)
+# Column Mapping (includes Shipment ID)
 # -------------------------------------------------------------
 default_cols = {
     "shipment_id": find_col(
@@ -347,7 +350,6 @@ with st.expander("Column Mapping", expanded=True):
             df_raw.columns,
             index=default_index(default_cols["gate_in"], df_raw.columns),
         )
-
         container_loaded_col = st.selectbox(
             "3-Container Loaded Timestamp",
             df_raw.columns,
@@ -387,14 +389,8 @@ dayfirst = st.checkbox(
     help="Tick if your timestamps are in DD/MM/YYYY format.",
 )
 
-unit_choice = st.selectbox(
-    "Display unit for D&D durations",
-    ["hours", "days"],
-    index=0,
-    help="Only affects how durations are shown. Slack is always in hours.",
-)
-unit_factor = 1.0 if unit_choice == "hours" else 1.0 / 24.0
-unit_label = "hrs" if unit_choice == "hours" else "days"
+unit_factor = 1.0 / 24.0  # show durations in days
+unit_label = "days"
 
 neg_policy = st.selectbox(
     "Milestone durations: negatives",
@@ -404,7 +400,7 @@ neg_policy = st.selectbox(
 )
 
 # -------------------------------------------------------------
-# Compute milestone durations
+# Compute milestone durations (base hours)
 # -------------------------------------------------------------
 gate_in_dt = to_datetime(df_raw[gate_in_col], dayfirst=dayfirst)
 container_loaded_dt = to_datetime(df_raw[container_loaded_col], dayfirst=dayfirst)
@@ -412,9 +408,9 @@ discharge_dt = to_datetime(df_raw[discharge_col], dayfirst=dayfirst)
 gate_out_dt = to_datetime(df_raw[gate_out_col], dayfirst=dayfirst)
 empty_return_dt = to_datetime(df_raw[empty_return_col], dayfirst=dayfirst)
 
-pol_gap = compute_duration_hours(gate_in_dt, container_loaded_dt)      # Dem POL base
-pod_dg_gap = compute_duration_hours(discharge_dt, gate_out_dt)         # Dem POD base
-pod_ge_gap = compute_duration_hours(gate_out_dt, empty_return_dt)      # Det POD base
+pol_gap = compute_duration_hours(gate_in_dt, container_loaded_dt)      # Dem POL base (hours)
+pod_dg_gap = compute_duration_hours(discharge_dt, gate_out_dt)         # Dem POD base (hours)
+pod_ge_gap = compute_duration_hours(gate_out_dt, empty_return_dt)      # Det POD base (hours)
 
 if neg_policy.startswith("Treat as NaN"):
     pol_gap = pol_gap.where(pol_gap >= 0)
@@ -432,7 +428,7 @@ df["_Dem_POD_hours"] = pod_dg_gap
 df["_Det_POD_hours"] = pod_ge_gap
 
 # -------------------------------------------------------------
-# Free-Day windows (LFD / OFD) & Detention free time
+# Free-Time Settings (Demurrage + Detention)
 # -------------------------------------------------------------
 def add_days_eod_vector(start_series, days_series, business_days_flag):
     return [
@@ -441,10 +437,10 @@ def add_days_eod_vector(start_series, days_series, business_days_flag):
     ]
 
 st.divider()
-st.subheader("Free Time Settings")
+st.subheader("Free Time Settings (in Days)")
 
 # --- POD Demurrage (LFD) ---
-st.markdown("**Destination Demurrage (POD) – LFD**")
+st.markdown("### Destination Demurrage (POD) – Free Days (LFD)")
 c1, c2, c3 = st.columns([1, 1, 2])
 with c1:
     default_free_days_pod = st.number_input(
@@ -487,14 +483,15 @@ df["_FreeDays_POD"], df["_FD_POD_source"] = apply_free_days(
     df, "_Carrier", "_POD Port", default_free_days_pod, pod_mapper, "POD"
 )
 df["_Estimated_LFD"] = add_days_eod_vector(discharge_dt, df["_FreeDays_POD"], business_days_pod)
-df["_Slack_LFD_hours"] = (gate_out_dt - pd.to_datetime(df["_Estimated_LFD"])).dt.total_seconds() / 3600.0
-# positive => gate out after LFD → over free time
+
+# NEW: Slack vs LFD = Dem POD hours − (free days × 24)
+df["_Slack_LFD_hours"] = df["_Dem_POD_hours"] - df["_FreeDays_POD"] * 24.0
 
 pod_cov = df["_FD_POD_source"].value_counts(dropna=False).to_dict()
 st.caption(f"POD Free Days source breakdown: {pod_cov}")
 
 # --- POL Demurrage (OFD) ---
-st.markdown("**Origin Demurrage (POL) – OFD**")
+st.markdown("### Origin Demurrage (POL) – Free Days (OFD)")
 c1, c2, c3 = st.columns([1, 1, 2])
 with c1:
     default_free_days_pol = st.number_input(
@@ -537,38 +534,57 @@ df["_FreeDays_POL"], df["_FD_POL_source"] = apply_free_days(
     df, "_Carrier", "_POL Port", default_free_days_pol, pol_mapper, "POL"
 )
 df["_Estimated_OFD"] = add_days_eod_vector(gate_in_dt, df["_FreeDays_POL"], business_days_pol)
-df["_Slack_OFD_hours"] = (container_loaded_dt - pd.to_datetime(df["_Estimated_OFD"])).dt.total_seconds() / 3600.0
-# positive => container loaded after OFD → over free time
+
+# NEW: Slack vs OFD = Dem POL hours − (free days × 24)
+df["_Slack_OFD_hours"] = df["_Dem_POL_hours"] - df["_FreeDays_POL"] * 24.0
 
 pol_cov = df["_FD_POL_source"].value_counts(dropna=False).to_dict()
 st.caption(f"POL Free Days source breakdown: {pol_cov}")
 
-# --- Detention free time at POD ---
-st.markdown("**Detention at POD – Free Time**")
+# --- Detention free days at POD ---
+st.markdown("### Detention at POD – Free Days")
 
-if unit_choice == "hours":
-    det_ft_val = st.number_input(
-        "Detention Free Time at POD (hours)",
-        min_value=0.0,
-        max_value=1000.0,
-        value=0.0,
-        step=1.0,
-        help="Amount of 'free' time after Gate Out before detention counts.",
+c1, c2 = st.columns([1, 2])
+with c1:
+    default_free_days_det = st.number_input(
+        "Default Detention Free Days at POD",
+        0,
+        60,
+        0,
+        1,
+        help="Default detention free days after Gate Out at POD.",
     )
-    detention_free_hours = det_ft_val
-else:
-    det_ft_val = st.number_input(
-        "Detention Free Time at POD (days)",
-        min_value=0.0,
-        max_value=100.0,
-        value=0.0,
-        step=0.5,
-        help="Amount of 'free' time after Gate Out before detention counts.",
+with c2:
+    det_map_pod_file = st.file_uploader(
+        "Optional Detention Free Days mapping CSV (POD Port, Carrier Name, Free Days)",
+        type=["csv"],
+        key="detmap",
+        help=(
+            "Columns (any order):\n"
+            "- POD Port (matches POD names)\n"
+            "- Carrier Name (optional)\n"
+            "- Free Days (integer)\n"
+        ),
     )
-    detention_free_hours = det_ft_val * 24.0
 
-df["_Det_Slack_hours"] = df["_Det_POD_hours"] - detention_free_hours
-# positive => detention hours > free time → over free time
+det_mapper = None
+if det_map_pod_file is not None:
+    try:
+        df_det_map = pd.read_csv(det_map_pod_file)
+        det_mapper = build_free_days_mapper(df_det_map, side="POD")
+        st.success("Loaded Detention Free Days mapping for POD.")
+    except Exception as e:
+        st.warning(f"Could not read Detention mapping CSV: {e}")
+
+df["_Det_FreeDays_POD"], df["_FD_DET_source"] = apply_free_days(
+    df, "_Carrier", "_POD Port", default_free_days_det, det_mapper, "POD"
+)
+
+# NEW: Detention Slack = Det hours − (Det free days × 24)
+df["_Det_Slack_hours"] = df["_Det_POD_hours"] - df["_Det_FreeDays_POD"] * 24.0
+
+det_cov = df["_FD_DET_source"].value_counts(dropna=False).to_dict()
+st.caption(f"Detention Free Days at POD source breakdown: {det_cov}")
 
 # -------------------------------------------------------------
 # Filters
@@ -600,7 +616,7 @@ pods = st.multiselect(
 if pods:
     df = df[df["_POD Port"].isin(pods)]
 
-# Keep aligned index for datetime series
+# Keep aligned index for datetime series / base durations
 idx = df.index
 
 dem_pol_hours = df.loc[idx, "_Dem_POL_hours"]
@@ -632,8 +648,6 @@ with tab_charts:
     total_dem_pod = dem_pod_hours.dropna().sum()
     total_dem_pol = dem_pol_hours.dropna().sum()
     total_det_pod = det_pod_hours.dropna().sum()
-
-    n_shipments = len(df)
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -696,7 +710,7 @@ with tab_port_carrier:
     dem_pod_summary = (
         dem_pod_df.groupby(["POD Port", "Carrier"])
         .agg(
-            Total_Dem_Hours=("Dem_POD_hours", "sum"),
+            Total_Dem_Days=("Dem_POD_hours", lambda s: s.sum() * unit_factor),
             **{
                 f"Avg_Dem_{unit_label}": ("Dem_POD_hours", lambda s: s.mean() * unit_factor),
                 f"Median_Dem_{unit_label}": ("Dem_POD_hours", lambda s: s.median() * unit_factor),
@@ -739,7 +753,7 @@ with tab_port_carrier:
     dem_pol_summary = (
         dem_pol_df.groupby(["POL Port", "Carrier"])
         .agg(
-            Total_Dem_Hours=("Dem_POL_hours", "sum"),
+            Total_Dem_Days=("Dem_POL_hours", lambda s: s.sum() * unit_factor),
             **{
                 f"Avg_Dem_{unit_label}": ("Dem_POL_hours", lambda s: s.mean() * unit_factor),
                 f"Median_Dem_{unit_label}": ("Dem_POL_hours", lambda s: s.median() * unit_factor),
@@ -782,7 +796,7 @@ with tab_port_carrier:
     det_summary = (
         det_df.groupby(["POD Port", "Carrier"])
         .agg(
-            Total_Det_Hours=("Det_POD_hours", "sum"),
+            Total_Det_Days=("Det_POD_hours", lambda s: s.sum() * unit_factor),
             **{
                 f"Avg_Det_{unit_label}": ("Det_POD_hours", lambda s: s.mean() * unit_factor),
                 f"Median_Det_{unit_label}": ("Det_POD_hours", lambda s: s.median() * unit_factor),
@@ -889,10 +903,13 @@ with tab_ship:
         }
     )
 
-    # Helper columns for sort
+    # Helper columns for sorting
     explorer_df["Dem_POL_disp"] = dem_pol_hours * unit_factor
     explorer_df["Dem_POD_disp"] = dem_pod_hours * unit_factor
     explorer_df["Det_POD_disp"] = det_pod_hours * unit_factor
+    explorer_df["Slack_LFD_hours"] = slack_lfd
+    explorer_df["Slack_OFD_hours"] = slack_ofd
+    explorer_df["Det_Slack_hours"] = slack_det
 
     sort_col_internal = sort_options[sort_key]
     explorer_df = explorer_df.sort_values(sort_col_internal, ascending=not descending)
