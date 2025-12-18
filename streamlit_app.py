@@ -376,16 +376,6 @@ with st.expander("Column Mapping", expanded=True):
             index=default_index(default_cols["empty_return"], df_raw.columns),
         )
 
-# --- NEW: deduplicate by chosen Shipment ID ---
-before_rows = len(df_raw)
-df_raw = df_raw.drop_duplicates(subset=[shipment_id_col]).reset_index(drop=True)
-after_rows = len(df_raw)
-if after_rows < before_rows:
-    st.info(
-        f"Deduplicated by Shipment ID '{shipment_id_col}': "
-        f"removed {before_rows - after_rows} duplicate rows."
-    )
-
 # -------------------------------------------------------------
 # Settings
 # -------------------------------------------------------------
@@ -733,11 +723,9 @@ with tab_port_carrier:
         .reset_index()
     )
 
-    # slack stats as columns
     slack_pod_summary = (
         dem_pod_df.groupby(["POD Port", "Carrier"])["Slack_LFD_hours"]
         .apply(slack_group_stats)
-        .unstack()
         .reset_index()
     )
 
@@ -778,11 +766,9 @@ with tab_port_carrier:
         .reset_index()
     )
 
-    # slack stats as columns
     slack_pol_summary = (
         dem_pol_df.groupby(["POL Port", "Carrier"])["Slack_OFD_hours"]
         .apply(slack_group_stats)
-        .unstack()
         .reset_index()
     )
 
@@ -824,11 +810,9 @@ with tab_port_carrier:
         .reset_index()
     )
 
-    # slack stats as columns
     det_slack_summary = (
         det_df.groupby(["POD Port", "Carrier"])["Det_Slack_hours"]
         .apply(slack_group_stats)
-        .unstack()
         .reset_index()
     )
 
