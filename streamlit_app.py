@@ -182,9 +182,14 @@ def apply_free_days(df_in: pd.DataFrame, car_col: str, port_col: str,
         # Carrier + Port
         if cp:
             combo_key = car_key + "||" + port_key
-            combo_days = combo_key.map(
-                lambda k: cp.get(tuple(k.split("||", 1)), np.nan)
-            )
+
+            def _lookup_combo(k):
+                parts = k.split("||", 1)
+                if len(parts) != 2:
+                    return np.nan
+                return cp.get((parts[0], parts[1]), np.nan)
+
+            combo_days = combo_key.map(_lookup_combo)
             mask = ~pd.isna(combo_days)
             days = np.where(mask, combo_days, days)
             source = np.where(mask, "carrier+port", source)
@@ -219,11 +224,11 @@ def slack_group_stats_days(slack_days: pd.Series) -> pd.Series:
     over = s[s > 0]
     return pd.Series({
         "Shipments": len(s),
-        "Over Count": (s > 0).sum(),
+        "Over Count": int((s > 0).sum()),
         "% Over": round(100.0 * (s > 0).mean(), 2),
-        "Avg Slack (days)": s.mean(),
-        "Avg Over (days)": over.mean() if len(over) else 0.0,
-        "Max Over (days)": over.max() if len(over) else 0.0
+        "Avg Slack (days)": float(s.mean()),
+        "Avg Over (days)": float(over.mean()) if len(over) else 0.0,
+        "Max Over (days)": float(over.max()) if len(over) else 0.0
     })
 
 def overtime_day_hist(slack_days: pd.Series) -> pd.DataFrame:
@@ -252,7 +257,7 @@ st.title("📦 Demurrage & Detention Time Analyzer")
 support_msg = []
 support_msg.append("✅ .xlsx (openpyxl)" if HAS_OPENPYXL else "❌ .xlsx (install `openpyxl`)")
 support_msg.append("✅ .xls (xlrd==1.2.0)" if HAS_XLRD12 else "❌ .xls (install `xlrd==1.2.0`)")
-st.info("File support in this environment: " + " | "join(support_msg))
+st.info("File support in this environment: " + " | ".join(support_msg))
 
 st.markdown(
     """
@@ -286,10 +291,7 @@ if HAS_OPENPYXL:
 if HAS_XLRD12:
     allowed_types.append("xls")
 
-uploaded = st.file_uploader(
-    "Upload your shipment file",
-    type=allowed_types,
-)
+uploaded = st.file_uploader("Upload your shipment file", type=allowed_types)
 if not uploaded:
     st.stop()
 
@@ -520,7 +522,6 @@ df["_FreeDays_POD"], df["_FD_POD_source"] = apply_free_days(
 )
 df["_Estimated_LFD"] = add_days_eod_vector(discharge_dt, df["_FreeDays_POD"], business_days_pod)
 
-# Slack vs LFD = Dem POD hours − (free days × 24)
 df["_Slack_LFD_hours"] = df["_Dem_POD_hours"] - df["_FreeDays_POD"] * 24.0
 df["_Slack_LFD_days"] = df["_Slack_LFD_hours"] * slack_unit_factor
 
@@ -572,7 +573,6 @@ df["_FreeDays_POL"], df["_FD_POL_source"] = apply_free_days(
 )
 df["_Estimated_OFD"] = add_days_eod_vector(gate_in_dt, df["_FreeDays_POL"], business_days_pol)
 
-# Slack vs OFD = Dem POL hours − (free days × 24)
 df["_Slack_OFD_hours"] = df["_Dem_POL_hours"] - df["_FreeDays_POL"] * 24.0
 df["_Slack_OFD_days"] = df["_Slack_OFD_hours"] * slack_unit_factor
 
@@ -618,7 +618,6 @@ df["_Det_FreeDays_POD"], df["_FD_DET_source"] = apply_free_days(
     df, "_Carrier", "_POD Port", default_free_days_det, det_mapper, "POD"
 )
 
-# Detention Slack = Det hours − (Det free days × 24)
 df["_Det_Slack_hours"] = df["_Det_POD_hours"] - df["_Det_FreeDays_POD"] * 24.0
 df["_Det_Slack_days"] = df["_Det_Slack_hours"] * slack_unit_factor
 
@@ -646,7 +645,6 @@ pods = st.multiselect("POD Ports (top volume first)", pod_list, default=None)
 if pods:
     df = df[df["_POD Port"].isin(pods)]
 
-# Keep aligned index
 idx = df.index
 
 # Base durations (hours)
@@ -664,7 +662,6 @@ carrier_vals = df.loc[idx, "_Carrier"]
 pol_vals = df.loc[idx, "_POL Port"]
 pod_vals = df.loc[idx, "_POD Port"]
 
-# Shipment-level status flags (within / over free days) using SLACK DAYS
 dem_pod_status = np.where(slack_lfd_days > 0, "Over Free Days", "Within Free Days")
 dem_pol_status = np.where(slack_ofd_days > 0, "Over Free Days", "Within Free Days")
 det_pod_status = np.where(slack_det_days > 0, "Over Free Days", "Within Free Days")
@@ -924,9 +921,7 @@ with tab_port_carrier:
         .reset_index()
     )
 
-    dem_pod_merged = dem_pod_summary.merge(
-        slack_pod_summary, on=["POD Port", "Carrier"], how="left"
-    )
+    dem_pod_merged = dem_pod_summary.merge(slack_pod_summary, on=["POD Port", "Carrier"], how="left")
 
     st.dataframe(dem_pod_merged, use_container_width=True)
     st.download_button(
@@ -965,9 +960,7 @@ with tab_port_carrier:
         .reset_index()
     )
 
-    dem_pol_merged = dem_pol_summary.merge(
-        slack_pol_summary, on=["POL Port", "Carrier"], how="left"
-    )
+    dem_pol_merged = dem_pol_summary.merge(slack_pol_summary, on=["POL Port", "Carrier"], how="left")
 
     st.dataframe(dem_pol_merged, use_container_width=True)
     st.download_button(
@@ -1043,18 +1036,14 @@ with tab_lane:
         Avg_Dem_POL_Days=("Dem_POL_hours", lambda s: s.mean() * duration_unit_factor),
         Avg_Dem_POD_Days=("Dem_POD_hours", lambda s: s.mean() * duration_unit_factor),
         Avg_Det_POD_Days=("Det_POD_hours", lambda s: s.mean() * duration_unit_factor),
+
         Avg_Slack_LFD_Days=("Slack_LFD_days", "mean"),
         Avg_Slack_OFD_Days=("Slack_OFD_days", "mean"),
         Avg_Slack_Det_Days=("Det_Slack_days", "mean"),
+
         Pct_Over_LFD=("Slack_LFD_days", lambda s: round(100.0 * (pd.to_numeric(s, errors="coerce") > 0).mean(), 2)),
         Pct_Over_OFD=("Slack_OFD_days", lambda s: round(100.0 * (pd.to_numeric(s, errors="coerce") > 0).mean(), 2)),
         Pct_Over_Det=("Det_Slack_days", lambda s: round(100.0 * (pd.to_numeric(s, errors="coerce") > 0).mean(), 2)),
-        Avg_Over_LFD_Days=("Slack_LFD_days", lambda s: pd.to_numeric(s, errors="coerce")[pd.to_numeric(s, errors="coerce") > 0].mean()
-                           if (pd.to_numeric(s, errors="coerce") > 0).any() else 0.0),
-        Avg_Over_OFD_Days=("Slack_OFD_days", lambda s: pd.to_numeric(s, errors="coerce")[pd.to_numeric(s, errors="coerce") > 0].mean()
-                           if (pd.to_numeric(s, errors="coerce") > 0).any() else 0.0),
-        Avg_Over_Det_Days=("Det_Slack_days", lambda s: pd.to_numeric(s, errors="coerce")[pd.to_numeric(s, errors="coerce") > 0].mean()
-                           if (pd.to_numeric(s, errors="coerce") > 0).any() else 0.0),
     ).reset_index()
 
     st.dataframe(lane_summary, use_container_width=True)
