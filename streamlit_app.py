@@ -1,10 +1,23 @@
 # =============================================================
-# D&D Focused Streamlit App
+# D&D Focused Streamlit App (v2)
 # - Demurrage at POD (Discharge -> Gate Out)
 # - Demurrage at POL (Gate In -> Container Loaded)
 # - Detention at POD (Gate Out -> Empty Return)
-# - Free days in DAYS, durations in DAYS (display), slack in HOURS
-# - Slack vs free time (hrs, + = overtime) at POD & POL
+#
+# Requested upgrades:
+# 1) Slack converted to DAYS everywhere (single unit across app)
+# 2) High-level KPIs show AVG SLACK (signed) per shipment (not avg durations)
+# 3) Add overtime distribution charts:
+#       X = "Days Over" (bucketed), Y = # Shipments (only slack > 0)
+# 4) Add drilldown under charts:
+#       Choose metric + days-over bucket -> show shipment list (Shipment Explorer style)
+#       Optional Carrier/Port filters (top-volume first)
+# 5) Global filters (Carrier/POL/POD) ordered top-volume first; default = All
+# 6) By Port & Carrier / By Lane summaries use slack in DAYS and include signed avg slack
+#
+# Notes:
+# - Durations are displayed in DAYS; slack is displayed in DAYS (signed).
+# - Overtime bucketing uses ceil(): 0.2 days over => bucket 1, 1.0 => bucket 1, 1.1 => bucket 2
 # =============================================================
 
 import pandas as pd
@@ -194,24 +207,43 @@ def apply_free_days(df_in: pd.DataFrame, car_col: str, port_col: str,
 
     return pd.to_numeric(days, errors="coerce"), pd.Series(source, index=df_in.index)
 
-def slack_group_stats(slack: pd.Series) -> pd.Series:
-    s = pd.to_numeric(slack, errors='coerce').dropna()
+def slack_group_stats_days(slack_days: pd.Series) -> pd.Series:
+    s = pd.to_numeric(slack_days, errors='coerce').dropna()
     if len(s) == 0:
         return pd.Series({
             "Shipments": 0,
             "Over Count": 0,
             "% Over": np.nan,
-            "Avg Over (hrs)": np.nan,
-            "Max Over (hrs)": np.nan
+            "Avg Slack (days)": np.nan,   # signed mean
+            "Avg Over (days)": np.nan,    # only s>0
+            "Max Over (days)": np.nan
         })
     over = s[s > 0]
     return pd.Series({
         "Shipments": len(s),
         "Over Count": (s > 0).sum(),
         "% Over": round(100.0 * (s > 0).mean(), 2),
-        "Avg Over (hrs)": over.mean() if len(over) else 0.0,
-        "Max Over (hrs)": over.max() if len(over) else 0.0
+        "Avg Slack (days)": s.mean(),
+        "Avg Over (days)": over.mean() if len(over) else 0.0,
+        "Max Over (days)": over.max() if len(over) else 0.0
     })
+
+def overtime_day_hist(slack_days: pd.Series) -> pd.DataFrame:
+    s = pd.to_numeric(slack_days, errors="coerce").dropna()
+    over = s[s > 0]
+    if over.empty:
+        return pd.DataFrame({"Over Days": [], "Shipments": []})
+
+    buckets = np.ceil(over).astype(int)  # 0.2->1, 1.0->1, 1.1->2
+    vc = buckets.value_counts().sort_index()
+    return pd.DataFrame({"Over Days": vc.index.astype(int), "Shipments": vc.values})
+
+def bucket_values_for_series(slack_days: pd.Series) -> list:
+    s = pd.to_numeric(slack_days, errors="coerce").dropna()
+    over = s[s > 0]
+    if over.empty:
+        return []
+    return sorted(np.ceil(over).astype(int).unique().tolist())
 
 # =============================================================
 # App layout
@@ -229,29 +261,22 @@ st.markdown(
     """
 This app focuses **only on Demurrage & Detention time**, *not* on charges.
 
-**Base durations (we show them in _days_):**
+**Base durations (displayed in days):**
+- **Demurrage at POD** = `Discharge` → `Gate Out`
+- **Demurrage at POL** = `Gate In` → `Container Loaded`
+- **Detention at POD** = `Gate Out` → `Empty Return`
 
-- **Demurrage at POD** = `Discharge` → `Gate Out`  
-- **Demurrage at POL** = `Gate In` → `Container Loaded`  
-- **Detention at POD** = `Gate Out` → `Empty Return`  
+All three are computed in hours and displayed in **days**.
 
-All three are first computed in hours, then converted to **days** for display.
+**Slack (displayed in days, signed, + = overtime)**  
+We treat free days as the *allowed* time and compare actual time:
 
-**Slack (in _hours_, + = overtime)**  
+- **Slack vs LFD (Dem POD)** = `Dem POD (hours)` − `POD Free Days × 24`
+- **Slack vs OFD (Dem POL)** = `Dem POL (hours)` − `POL Free Days × 24`
+- **Detention Slack (POD)** = `Det POD (hours)` − `Det Free Days × 24`
 
-We treat free days as the *allowed* time and compare the actual time:
-
-- **Slack vs LFD (Dem POD)**  
-  = `Demurrage at POD (hours)` − `POD Free Days × 24`  
-
-- **Slack vs OFD (Dem POL)**  
-  = `Demurrage at POL (hours)` − `POL Free Days × 24`  
-
-- **Detention Slack at POD**  
-  = `Detention at POD (hours)` − `Detention Free Days at POD × 24`  
-
-> Positive slack = **Over Free Days**  
-> Zero or negative slack = **Within Free Days**
+> **Slack > 0** = Over Free Days (overtime)  
+> **Slack ≤ 0** = Within Free Days (may be negative)
 """
 )
 
@@ -376,7 +401,7 @@ with st.expander("Column Mapping", expanded=True):
             index=default_index(default_cols["empty_return"], df_raw.columns),
         )
 
-# --- NEW: deduplicate by chosen Shipment ID ---
+# --- Deduplicate by chosen Shipment ID ---
 before_rows = len(df_raw)
 df_raw = df_raw.drop_duplicates(subset=[shipment_id_col]).reset_index(drop=True)
 after_rows = len(df_raw)
@@ -398,8 +423,13 @@ dayfirst = st.checkbox(
     help="Tick if your timestamps are in DD/MM/YYYY format.",
 )
 
-unit_factor = 1.0 / 24.0  # display durations in days
-unit_label = "days"
+# display: durations in days
+duration_unit_factor = 1.0 / 24.0
+duration_unit_label = "days"
+
+# display: slack in days (requested)
+slack_unit_factor = 1.0 / 24.0
+slack_unit_label = "days"
 
 neg_policy = st.selectbox(
     "Milestone durations: negatives",
@@ -495,6 +525,7 @@ df["_Estimated_LFD"] = add_days_eod_vector(discharge_dt, df["_FreeDays_POD"], bu
 
 # Slack vs LFD = Dem POD hours − (free days × 24)
 df["_Slack_LFD_hours"] = df["_Dem_POD_hours"] - df["_FreeDays_POD"] * 24.0
+df["_Slack_LFD_days"] = df["_Slack_LFD_hours"] * slack_unit_factor
 
 pod_cov = df["_FD_POD_source"].value_counts(dropna=False).to_dict()
 st.caption(f"POD Free Days source breakdown: {pod_cov}")
@@ -546,6 +577,7 @@ df["_Estimated_OFD"] = add_days_eod_vector(gate_in_dt, df["_FreeDays_POL"], busi
 
 # Slack vs OFD = Dem POL hours − (free days × 24)
 df["_Slack_OFD_hours"] = df["_Dem_POL_hours"] - df["_FreeDays_POL"] * 24.0
+df["_Slack_OFD_days"] = df["_Slack_OFD_hours"] * slack_unit_factor
 
 pol_cov = df["_FD_POL_source"].value_counts(dropna=False).to_dict()
 st.caption(f"POL Free Days source breakdown: {pol_cov}")
@@ -591,60 +623,54 @@ df["_Det_FreeDays_POD"], df["_FD_DET_source"] = apply_free_days(
 
 # Detention Slack = Det hours − (Det free days × 24)
 df["_Det_Slack_hours"] = df["_Det_POD_hours"] - df["_Det_FreeDays_POD"] * 24.0
+df["_Det_Slack_days"] = df["_Det_Slack_hours"] * slack_unit_factor
 
 det_cov = df["_FD_DET_source"].value_counts(dropna=False).to_dict()
 st.caption(f"Detention Free Days at POD source breakdown: {det_cov}")
 
 # -------------------------------------------------------------
-# Filters
+# Global Filters (top-volume first, default All)
 # -------------------------------------------------------------
 st.divider()
 st.subheader("Filters")
 
-carriers = st.multiselect(
-    "Carriers",
-    sorted(df["_Carrier"].dropna().unique().tolist()),
-    default=None,
-)
+carrier_list = df["_Carrier"].dropna().value_counts().index.tolist()
+carriers = st.multiselect("Carriers (top volume first)", carrier_list, default=None)
 if carriers:
     df = df[df["_Carrier"].isin(carriers)]
 
-pols = st.multiselect(
-    "POL Ports",
-    sorted(df["_POL Port"].dropna().unique().tolist()),
-    default=None,
-)
+pol_list = df["_POL Port"].dropna().value_counts().index.tolist()
+pols = st.multiselect("POL Ports (top volume first)", pol_list, default=None)
 if pols:
     df = df[df["_POL Port"].isin(pols)]
 
-pods = st.multiselect(
-    "POD Ports",
-    sorted(df["_POD Port"].dropna().unique().tolist()),
-    default=None,
-)
+pod_list = df["_POD Port"].dropna().value_counts().index.tolist()
+pods = st.multiselect("POD Ports (top volume first)", pod_list, default=None)
 if pods:
     df = df[df["_POD Port"].isin(pods)]
 
-# Keep aligned index for datetime series / base durations
+# Keep aligned index
 idx = df.index
 
+# Base durations (hours)
 dem_pol_hours = df.loc[idx, "_Dem_POL_hours"]
 dem_pod_hours = df.loc[idx, "_Dem_POD_hours"]
 det_pod_hours = df.loc[idx, "_Det_POD_hours"]
 
-slack_lfd = df.loc[idx, "_Slack_LFD_hours"]
-slack_ofd = df.loc[idx, "_Slack_OFD_hours"]
-slack_det = df.loc[idx, "_Det_Slack_hours"]
+# Slack (days)
+slack_lfd_days = df.loc[idx, "_Slack_LFD_days"]
+slack_ofd_days = df.loc[idx, "_Slack_OFD_days"]
+slack_det_days = df.loc[idx, "_Det_Slack_days"]
 
 shipment_ids = df.loc[idx, "_ShipmentID"]
 carrier_vals = df.loc[idx, "_Carrier"]
 pol_vals = df.loc[idx, "_POL Port"]
 pod_vals = df.loc[idx, "_POD Port"]
 
-# Shipment-level status flags (within / over free days)
-dem_pod_status = np.where(slack_lfd > 0, "Over Free Days", "Within Free Days")
-dem_pol_status = np.where(slack_ofd > 0, "Over Free Days", "Within Free Days")
-det_pod_status = np.where(slack_det > 0, "Over Free Days", "Within Free Days")
+# Shipment-level status flags (within / over free days) using SLACK DAYS
+dem_pod_status = np.where(slack_lfd_days > 0, "Over Free Days", "Within Free Days")
+dem_pol_status = np.where(slack_ofd_days > 0, "Over Free Days", "Within Free Days")
+det_pod_status = np.where(slack_det_days > 0, "Over Free Days", "Within Free Days")
 
 # -------------------------------------------------------------
 # Tabs
@@ -663,46 +689,169 @@ with tab_charts:
     total_dem_pol = dem_pol_hours.dropna().sum()
     total_det_pod = det_pod_hours.dropna().sum()
 
+    def slack_caption(avg_val):
+        if pd.isna(avg_val):
+            return ""
+        if avg_val < 0:
+            return "🟦 Negative avg slack = within free days (on average)."
+        if avg_val > 0:
+            return "🟥 Positive avg slack = overtime (on average)."
+        return "⬜ Avg slack = 0."
+
     c1, c2, c3 = st.columns(3)
+
     with c1:
         st.metric(
-            f"Total Demurrage at POD ({unit_label})",
-            f"{total_dem_pod * unit_factor:,.2f}",
+            f"Total Demurrage at POD ({duration_unit_label})",
+            f"{total_dem_pod * duration_unit_factor:,.2f}",
         )
+        avg_slack = slack_lfd_days.mean()
         st.metric(
-            f"Avg Demurrage per Shipment at POD ({unit_label})",
-            f"{(dem_pod_hours.mean() or 0) * unit_factor:,.2f}",
+            f"Avg Slack vs LFD at POD ({slack_unit_label})",
+            f"{(avg_slack if pd.notna(avg_slack) else 0):,.2f}",
+            help="Signed slack in days: negative = within free days; positive = overtime."
         )
+        st.caption(slack_caption(avg_slack))
+
     with c2:
         st.metric(
-            f"Total Demurrage at POL ({unit_label})",
-            f"{total_dem_pol * unit_factor:,.2f}",
+            f"Total Demurrage at POL ({duration_unit_label})",
+            f"{total_dem_pol * duration_unit_factor:,.2f}",
         )
+        avg_slack = slack_ofd_days.mean()
         st.metric(
-            f"Avg Demurrage per Shipment at POL ({unit_label})",
-            f"{(dem_pol_hours.mean() or 0) * unit_factor:,.2f}",
+            f"Avg Slack vs OFD at POL ({slack_unit_label})",
+            f"{(avg_slack if pd.notna(avg_slack) else 0):,.2f}",
+            help="Signed slack in days: negative = within free days; positive = overtime."
         )
+        st.caption(slack_caption(avg_slack))
+
     with c3:
         st.metric(
-            f"Total Detention at POD ({unit_label})",
-            f"{total_det_pod * unit_factor:,.2f}",
+            f"Total Detention at POD ({duration_unit_label})",
+            f"{total_det_pod * duration_unit_factor:,.2f}",
         )
+        avg_slack = slack_det_days.mean()
         st.metric(
-            f"Avg Detention per Shipment at POD ({unit_label})",
-            f"{(det_pod_hours.mean() or 0) * unit_factor:,.2f}",
+            f"Avg Detention Slack at POD ({slack_unit_label})",
+            f"{(avg_slack if pd.notna(avg_slack) else 0):,.2f}",
+            help="Signed slack in days: negative = within free days; positive = overtime."
         )
+        st.caption(slack_caption(avg_slack))
 
-    st.markdown("#### Overall Slack Distributions (hrs, + = overtime)")
+    st.markdown(f"#### Overall Slack Distributions ({slack_unit_label}, + = overtime)")
     colA, colB, colC = st.columns(3)
     with colA:
         st.write("**Slack vs LFD (Dem POD)**")
-        st.write(slack_lfd.describe())
+        st.write(slack_lfd_days.describe())
     with colB:
         st.write("**Slack vs OFD (Dem POL)**")
-        st.write(slack_ofd.describe())
+        st.write(slack_ofd_days.describe())
     with colC:
         st.write("**Detention Slack at POD**")
-        st.write(slack_det.describe())
+        st.write(slack_det_days.describe())
+
+    # ----------------------------
+    # NEW: Overtime distribution charts (only slack > 0)
+    # ----------------------------
+    st.divider()
+    st.subheader("Overtime Distribution (Over Free Days Only)")
+    st.caption("X-axis is whole **days over** (bucketed using ceil). Y-axis is **# shipments**.")
+
+    h1, h2, h3 = st.columns(3)
+    with h1:
+        st.write("**Dem POD overtime (days)**")
+        hist = overtime_day_hist(slack_lfd_days)
+        if hist.empty:
+            st.info("No overtime shipments for Dem POD.")
+        else:
+            st.bar_chart(hist.set_index("Over Days"))
+    with h2:
+        st.write("**Dem POL overtime (days)**")
+        hist = overtime_day_hist(slack_ofd_days)
+        if hist.empty:
+            st.info("No overtime shipments for Dem POL.")
+        else:
+            st.bar_chart(hist.set_index("Over Days"))
+    with h3:
+        st.write("**Detention overtime (days)**")
+        hist = overtime_day_hist(slack_det_days)
+        if hist.empty:
+            st.info("No overtime shipments for Detention.")
+        else:
+            st.bar_chart(hist.set_index("Over Days"))
+
+    # ----------------------------
+    # NEW: Drilldown picker + table
+    # ----------------------------
+    st.divider()
+    st.subheader("Overtime Drilldown (pick a metric + days-over bucket)")
+
+    metric_options = {
+        "Demurrage POD (Slack vs LFD)": ("_Slack_LFD_days", "POD"),
+        "Demurrage POL (Slack vs OFD)": ("_Slack_OFD_days", "POL"),
+        "Detention POD (Detention Slack)": ("_Det_Slack_days", "POD"),
+    }
+    metric_label = st.selectbox("Metric", list(metric_options.keys()), index=0)
+    slack_col, side = metric_options[metric_label]
+
+    available_buckets = bucket_values_for_series(df[slack_col])
+
+    if not available_buckets:
+        st.info("No overtime shipments for the selected metric.")
+    else:
+        selected_bucket = st.selectbox("Show shipments over by (days)", available_buckets, index=0)
+        lo, hi = selected_bucket - 1, selected_bucket
+
+        drill = df[
+            (pd.to_numeric(df[slack_col], errors="coerce") > lo)
+            & (pd.to_numeric(df[slack_col], errors="coerce") <= hi)
+        ].copy()
+
+        # Optional filters (top-volume first within drill set)
+        st.caption("Optional drill filters (defaults to All):")
+        fc1, fc2 = st.columns(2)
+
+        with fc1:
+            carrier_order = drill["_Carrier"].value_counts().index.tolist()
+            carrier_pick = st.multiselect("Carrier (top volume first)", carrier_order, default=None)
+
+        with fc2:
+            if side == "POL":
+                port_order = drill["_POL Port"].value_counts().index.tolist()
+                port_pick = st.multiselect("POL Port (top volume first)", port_order, default=None)
+            else:
+                port_order = drill["_POD Port"].value_counts().index.tolist()
+                port_pick = st.multiselect("POD Port (top volume first)", port_order, default=None)
+
+        if carrier_pick:
+            drill = drill[drill["_Carrier"].isin(carrier_pick)]
+        if port_pick:
+            if side == "POL":
+                drill = drill[drill["_POL Port"].isin(port_pick)]
+            else:
+                drill = drill[drill["_POD Port"].isin(port_pick)]
+
+        # Shipment Explorer-like view (minimal, focused on overtime)
+        drill_view = pd.DataFrame({
+            "Shipment ID": drill["_ShipmentID"],
+            "Carrier": drill["_Carrier"],
+            "POL Port": drill["_POL Port"],
+            "POD Port": drill["_POD Port"],
+            "Slack (days)": pd.to_numeric(drill[slack_col], errors="coerce"),
+            f"Demurrage at POL ({duration_unit_label})": pd.to_numeric(drill["_Dem_POL_hours"], errors="coerce") * duration_unit_factor,
+            f"Demurrage at POD ({duration_unit_label})": pd.to_numeric(drill["_Dem_POD_hours"], errors="coerce") * duration_unit_factor,
+            f"Detention at POD ({duration_unit_label})": pd.to_numeric(drill["_Det_POD_hours"], errors="coerce") * duration_unit_factor,
+        }).sort_values("Slack (days)", ascending=False)
+
+        st.dataframe(drill_view, use_container_width=True)
+
+        st.download_button(
+            "Download Drilldown Shipments (CSV)",
+            drill_view.to_csv(index=False).encode("utf-8"),
+            file_name="dd_overtime_drilldown_shipments.csv",
+            mime="text/csv",
+        )
 
 # ============================
 # TAB 2: By Port & Carrier
@@ -710,33 +859,32 @@ with tab_charts:
 with tab_port_carrier:
     st.subheader("By Port & Carrier")
 
+    # -------------------------
     # Demurrage POD
+    # -------------------------
     st.markdown("### Demurrage at POD (Discharge → Gate Out)")
     dem_pod_df = pd.DataFrame(
         {
             "POD Port": pod_vals,
             "Carrier": carrier_vals,
             "Dem_POD_hours": dem_pod_hours,
-            "Slack_LFD_hours": slack_lfd,
+            "Slack_LFD_days": slack_lfd_days,
         }
     )
 
     dem_pod_summary = (
         dem_pod_df.groupby(["POD Port", "Carrier"])
         .agg(
-            Total_Dem_Days=("Dem_POD_hours", lambda s: s.sum() * unit_factor),
-            **{
-                f"Avg_Dem_{unit_label}": ("Dem_POD_hours", lambda s: s.mean() * unit_factor),
-                f"Median_Dem_{unit_label}": ("Dem_POD_hours", lambda s: s.median() * unit_factor),
-            },
+            Total_Dem_Days=("Dem_POD_hours", lambda s: s.sum() * duration_unit_factor),
+            Avg_Dem_Days=("Dem_POD_hours", lambda s: s.mean() * duration_unit_factor),
+            Median_Dem_Days=("Dem_POD_hours", lambda s: s.median() * duration_unit_factor),
         )
         .reset_index()
     )
 
-    # slack stats as columns
     slack_pod_summary = (
-        dem_pod_df.groupby(["POD Port", "Carrier"])["Slack_LFD_hours"]
-        .apply(slack_group_stats)
+        dem_pod_df.groupby(["POD Port", "Carrier"])["Slack_LFD_days"]
+        .apply(slack_group_stats_days)
         .unstack()
         .reset_index()
     )
@@ -755,33 +903,32 @@ with tab_port_carrier:
 
     st.divider()
 
+    # -------------------------
     # Demurrage POL
+    # -------------------------
     st.markdown("### Demurrage at POL (Gate In → Container Loaded)")
     dem_pol_df = pd.DataFrame(
         {
             "POL Port": pol_vals,
             "Carrier": carrier_vals,
             "Dem_POL_hours": dem_pol_hours,
-            "Slack_OFD_hours": slack_ofd,
+            "Slack_OFD_days": slack_ofd_days,
         }
     )
 
     dem_pol_summary = (
         dem_pol_df.groupby(["POL Port", "Carrier"])
         .agg(
-            Total_Dem_Days=("Dem_POL_hours", lambda s: s.sum() * unit_factor),
-            **{
-                f"Avg_Dem_{unit_label}": ("Dem_POL_hours", lambda s: s.mean() * unit_factor),
-                f"Median_Dem_{unit_label}": ("Dem_POL_hours", lambda s: s.median() * unit_factor),
-            },
+            Total_Dem_Days=("Dem_POL_hours", lambda s: s.sum() * duration_unit_factor),
+            Avg_Dem_Days=("Dem_POL_hours", lambda s: s.mean() * duration_unit_factor),
+            Median_Dem_Days=("Dem_POL_hours", lambda s: s.median() * duration_unit_factor),
         )
         .reset_index()
     )
 
-    # slack stats as columns
     slack_pol_summary = (
-        dem_pol_df.groupby(["POL Port", "Carrier"])["Slack_OFD_hours"]
-        .apply(slack_group_stats)
+        dem_pol_df.groupby(["POL Port", "Carrier"])["Slack_OFD_days"]
+        .apply(slack_group_stats_days)
         .unstack()
         .reset_index()
     )
@@ -800,34 +947,33 @@ with tab_port_carrier:
 
     st.divider()
 
+    # -------------------------
     # Detention POD
+    # -------------------------
     st.markdown("### Detention at POD (Gate Out → Empty Return)")
     det_df = pd.DataFrame(
         {
             "POD Port": pod_vals,
             "Carrier": carrier_vals,
             "Det_POD_hours": det_pod_hours,
-            "Det_Slack_hours": slack_det,
+            "Det_Slack_days": slack_det_days,
         }
     )
 
     det_summary = (
         det_df.groupby(["POD Port", "Carrier"])
         .agg(
-            Total_Det_Days=("Det_POD_hours", lambda s: s.sum() * unit_factor),
-            **{
-                f"Avg_Det_{unit_label}": ("Det_POD_hours", lambda s: s.mean() * unit_factor),
-                f"Median_Det_{unit_label}": ("Det_POD_hours", lambda s: s.median() * unit_factor),
-                f"Max_Det_{unit_label}": ("Det_POD_hours", lambda s: s.max() * unit_factor),
-            },
+            Total_Det_Days=("Det_POD_hours", lambda s: s.sum() * duration_unit_factor),
+            Avg_Det_Days=("Det_POD_hours", lambda s: s.mean() * duration_unit_factor),
+            Median_Det_Days=("Det_POD_hours", lambda s: s.median() * duration_unit_factor),
+            Max_Det_Days=("Det_POD_hours", lambda s: s.max() * duration_unit_factor),
         )
         .reset_index()
     )
 
-    # slack stats as columns
     det_slack_summary = (
-        det_df.groupby(["POD Port", "Carrier"])["Det_Slack_hours"]
-        .apply(slack_group_stats)
+        det_df.groupby(["POD Port", "Carrier"])["Det_Slack_days"]
+        .apply(slack_group_stats_days)
         .unstack()
         .reset_index()
     )
@@ -855,9 +1001,9 @@ with tab_lane:
             "Dem_POL_hours": dem_pol_hours,
             "Dem_POD_hours": dem_pod_hours,
             "Det_POD_hours": det_pod_hours,
-            "Slack_LFD_hours": slack_lfd,
-            "Slack_OFD_hours": slack_ofd,
-            "Det_Slack_hours": slack_det,
+            "Slack_LFD_days": slack_lfd_days,
+            "Slack_OFD_days": slack_ofd_days,
+            "Det_Slack_days": slack_det_days,
         }
     )
 
@@ -865,17 +1011,27 @@ with tab_lane:
 
     lane_summary = lane_group.agg(
         Shipments=("Dem_POD_hours", "count"),
-        **{
-            f"Avg_Dem_POL_{unit_label}": ("Dem_POL_hours", lambda s: s.mean() * unit_factor),
-            f"Avg_Dem_POD_{unit_label}": ("Dem_POD_hours", lambda s: s.mean() * unit_factor),
-            f"Avg_Det_POD_{unit_label}": ("Det_POD_hours", lambda s: s.mean() * unit_factor),
-            "% Over LFD": ("Slack_LFD_hours", lambda s: round(100.0 * (s > 0).mean(), 2)),
-            "% Over OFD": ("Slack_OFD_hours", lambda s: round(100.0 * (s > 0).mean(), 2)),
-            "% Over Det": ("Det_Slack_hours", lambda s: round(100.0 * (s > 0).mean(), 2)),
-            "Avg Over LFD (hrs)": ("Slack_LFD_hours", lambda s: s[s > 0].mean() if (s > 0).any() else 0.0),
-            "Avg Over OFD (hrs)": ("Slack_OFD_hours", lambda s: s[s > 0].mean() if (s > 0).any() else 0.0),
-            "Avg Over Det (hrs)": ("Det_Slack_hours", lambda s: s[s > 0].mean() if (s > 0).any() else 0.0),
-        },
+        Avg_Dem_POL_Days=("Dem_POL_hours", lambda s: s.mean() * duration_unit_factor),
+        Avg_Dem_POD_Days=("Dem_POD_hours", lambda s: s.mean() * duration_unit_factor),
+        Avg_Det_POD_Days=("Det_POD_hours", lambda s: s.mean() * duration_unit_factor),
+
+        # Signed average slack (requested)
+        Avg_Slack_LFD_Days=("Slack_LFD_days", "mean"),
+        Avg_Slack_OFD_Days=("Slack_OFD_days", "mean"),
+        Avg_Slack_Det_Days=("Det_Slack_days", "mean"),
+
+        # Overtime share
+        Pct_Over_LFD=("Slack_LFD_days", lambda s: round(100.0 * (pd.to_numeric(s, errors="coerce") > 0).mean(), 2)),
+        Pct_Over_OFD=("Slack_OFD_days", lambda s: round(100.0 * (pd.to_numeric(s, errors="coerce") > 0).mean(), 2)),
+        Pct_Over_Det=("Det_Slack_days", lambda s: round(100.0 * (pd.to_numeric(s, errors="coerce") > 0).mean(), 2)),
+
+        # Avg overtime only
+        Avg_Over_LFD_Days=("Slack_LFD_days", lambda s: pd.to_numeric(s, errors="coerce")[pd.to_numeric(s, errors="coerce") > 0].mean()
+                           if (pd.to_numeric(s, errors="coerce") > 0).any() else 0.0),
+        Avg_Over_OFD_Days=("Slack_OFD_days", lambda s: pd.to_numeric(s, errors="coerce")[pd.to_numeric(s, errors="coerce") > 0].mean()
+                           if (pd.to_numeric(s, errors="coerce") > 0).any() else 0.0),
+        Avg_Over_Det_Days=("Det_Slack_days", lambda s: pd.to_numeric(s, errors="coerce")[pd.to_numeric(s, errors="coerce") > 0].mean()
+                           if (pd.to_numeric(s, errors="coerce") > 0).any() else 0.0),
     ).reset_index()
 
     st.dataframe(lane_summary, use_container_width=True)
@@ -893,12 +1049,12 @@ with tab_ship:
     st.subheader("Shipment Explorer")
 
     sort_options = {
-        f"Demurrage at POD ({unit_label})": "Dem_POD_disp",
-        f"Demurrage at POL ({unit_label})": "Dem_POL_disp",
-        f"Detention at POD ({unit_label})": "Det_POD_disp",
-        "Slack vs LFD (hrs, + = over)": "Slack_LFD_hours",
-        "Slack vs OFD (hrs, + = over)": "Slack_OFD_hours",
-        "Detention Slack at POD (hrs, + = over)": "Det_Slack_hours",
+        f"Demurrage at POD ({duration_unit_label})": "Dem_POD_disp",
+        f"Demurrage at POL ({duration_unit_label})": "Dem_POL_disp",
+        f"Detention at POD ({duration_unit_label})": "Det_POD_disp",
+        f"Slack vs LFD ({slack_unit_label}, + = over)": "Slack_LFD_days",
+        f"Slack vs OFD ({slack_unit_label}, + = over)": "Slack_OFD_days",
+        f"Detention Slack at POD ({slack_unit_label}, + = over)": "Det_Slack_days",
     }
     sort_key = st.selectbox("Sort by", list(sort_options.keys()), index=0)
     descending = st.checkbox("Sort descending?", value=True)
@@ -914,12 +1070,12 @@ with tab_ship:
             "Discharge (POD)": discharge_dt.loc[idx],
             "Gate Out (POD)": gate_out_dt.loc[idx],
             "Empty Return (POD)": empty_return_dt.loc[idx],
-            f"Demurrage at POL ({unit_label})": dem_pol_hours * unit_factor,
-            f"Demurrage at POD ({unit_label})": dem_pod_hours * unit_factor,
-            f"Detention at POD ({unit_label})": det_pod_hours * unit_factor,
-            "Slack vs OFD (hrs, + = over)": slack_ofd,
-            "Slack vs LFD (hrs, + = over)": slack_lfd,
-            "Detention Slack at POD (hrs, + = over)": slack_det,
+            f"Demurrage at POL ({duration_unit_label})": dem_pol_hours * duration_unit_factor,
+            f"Demurrage at POD ({duration_unit_label})": dem_pod_hours * duration_unit_factor,
+            f"Detention at POD ({duration_unit_label})": det_pod_hours * duration_unit_factor,
+            f"Slack vs OFD ({slack_unit_label}, + = over)": slack_ofd_days,
+            f"Slack vs LFD ({slack_unit_label}, + = over)": slack_lfd_days,
+            f"Detention Slack at POD ({slack_unit_label}, + = over)": slack_det_days,
             "Demurrage Status at POL": dem_pol_status,
             "Demurrage Status at POD": dem_pod_status,
             "Detention Status at POD": det_pod_status,
@@ -927,12 +1083,12 @@ with tab_ship:
     )
 
     # Helper columns for sorting
-    explorer_df["Dem_POL_disp"] = dem_pol_hours * unit_factor
-    explorer_df["Dem_POD_disp"] = dem_pod_hours * unit_factor
-    explorer_df["Det_POD_disp"] = det_pod_hours * unit_factor
-    explorer_df["Slack_LFD_hours"] = slack_lfd
-    explorer_df["Slack_OFD_hours"] = slack_ofd
-    explorer_df["Det_Slack_hours"] = slack_det
+    explorer_df["Dem_POL_disp"] = dem_pol_hours * duration_unit_factor
+    explorer_df["Dem_POD_disp"] = dem_pod_hours * duration_unit_factor
+    explorer_df["Det_POD_disp"] = det_pod_hours * duration_unit_factor
+    explorer_df["Slack_LFD_days"] = slack_lfd_days
+    explorer_df["Slack_OFD_days"] = slack_ofd_days
+    explorer_df["Det_Slack_days"] = slack_det_days
 
     sort_col_internal = sort_options[sort_key]
     explorer_df = explorer_df.sort_values(sort_col_internal, ascending=not descending)
@@ -947,12 +1103,12 @@ with tab_ship:
         "Discharge (POD)",
         "Gate Out (POD)",
         "Empty Return (POD)",
-        f"Demurrage at POL ({unit_label})",
-        f"Demurrage at POD ({unit_label})",
-        f"Detention at POD ({unit_label})",
-        "Slack vs OFD (hrs, + = over)",
-        "Slack vs LFD (hrs, + = over)",
-        "Detention Slack at POD (hrs, + = over)",
+        f"Demurrage at POL ({duration_unit_label})",
+        f"Demurrage at POD ({duration_unit_label})",
+        f"Detention at POD ({duration_unit_label})",
+        f"Slack vs OFD ({slack_unit_label}, + = over)",
+        f"Slack vs LFD ({slack_unit_label}, + = over)",
+        f"Detention Slack at POD ({slack_unit_label}, + = over)",
         "Demurrage Status at POL",
         "Demurrage Status at POD",
         "Detention Status at POD",
@@ -963,6 +1119,6 @@ with tab_ship:
     st.download_button(
         "Download Shipment-level D&D Time (CSV)",
         explorer_df[show_cols].to_csv(index=False).encode("utf-8"),
-        file_name="shipment_dd_time_slack_completed.csv",
+        file_name="shipment_dd_time_slack_days.csv",
         mime="text/csv",
     )
