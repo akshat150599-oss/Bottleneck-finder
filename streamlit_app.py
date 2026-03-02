@@ -1,12 +1,6 @@
-# =============================================================
-# D&D Focused Streamlit App
-# - Demurrage at POD (Discharge -> Gate Out)
-# - Demurrage at POL (Gate In -> Container Loaded)
-# - Detention at POD (Gate Out -> Empty Return)
-# - Free days in DAYS, durations in DAYS (display), slack in DAYS
-# - Slack vs free time (days, + = overtime) at POD & POL
-# =============================================================
-
+# dd_time_analyzer_control_tower.py
+# Full updated Streamlit app with Control Tower block and top filters
+# Requirements: streamlit, pandas, numpy, openpyxl (optional), xlrd==1.2.0 (optional)
 import pandas as pd
 import numpy as np
 from io import BytesIO
@@ -24,9 +18,8 @@ if not hasattr(st, "divider"):
     st.divider = _divider
 
 # =============================================================
-# Helper functions
+# Helper functions (kept from your original)
 # =============================================================
-
 def has_openpyxl() -> bool:
     try:
         import openpyxl  # noqa: F401
@@ -225,11 +218,186 @@ def over_days(series: pd.Series) -> np.ndarray:
     return np.where(pd.notna(x) & (x > 0), x, 0.0)
 
 # =============================================================
-# App layout
+# Control Tower renderer (new block)
 # =============================================================
+def format_money(x):
+    try:
+        return f"${x:,.0f}" if pd.notna(x) else "$0"
+    except Exception:
+        return "$0"
 
-st.set_page_config(page_title="D&D Time Analyzer", layout="wide")
-st.title("📦 Demurrage & Detention Time Analyzer")
+def render_control_tower(df: pd.DataFrame):
+    """
+    Control Tower: KPI cards + small mini-charts driven from existing df columns.
+    Expects df has:
+      - _Slack_LFD_days, _Slack_OFD_days, _Det_Slack_days
+      - _Dem_POD_hours, _Dem_POL_hours, _Det_POD_hours
+      - _Carrier, _POD Port, _POL Port
+      - _FreeDays_POD, _FreeDays_POL, _Det_FreeDays_POD
+    Returns: computed df (copy) with extra computed cols.
+    """
+    st.divider()
+    with st.expander("Control Tower settings (historical substitutes)", expanded=False):
+        cta, ctb, ctc = st.columns([1,1,1])
+        with cta:
+            dwell_threshold = st.number_input("Dwell threshold (days)", min_value=1, max_value=60, value=3, step=1)
+            approach_window = st.number_input("Approach window (days) - substitute", min_value=0, max_value=7, value=1, step=1)
+            lfd_today_window = st.number_input("LFD-today window (days) - substitute", min_value=0, max_value=7, value=1, step=1)
+        with ctb:
+            rate_pol = st.number_input("Avg demurrage rate @ POL ($/day)", min_value=0.0, value=15.0, step=1.0, format="%.2f")
+            rate_pod = st.number_input("Avg demurrage rate @ POD ($/day)", min_value=0.0, value=20.0, step=1.0, format="%.2f")
+            rate_det = st.number_input("Avg detention rate @ POD ($/day)", min_value=0.0, value=8.0, step=1.0, format="%.2f")
+        with ctc:
+            dwell_mode = st.selectbox("Dwell flag mode", ["Combined (any leg)","Per-leg separate"], index=0)
+            show_top_n = st.number_input("Top N carriers/ports to show", min_value=1, max_value=20, value=5, step=1)
+
+    # compute on a copy
+    d = df.copy()
+
+    # durations in days
+    d["Dem_POL_days"] = pd.to_numeric(d.get("_Dem_POL_hours"), errors="coerce") / 24.0
+    d["Dem_POD_days"] = pd.to_numeric(d.get("_Dem_POD_hours"), errors="coerce") / 24.0
+    d["Det_POD_days"] = pd.to_numeric(d.get("_Det_POD_hours"), errors="coerce") / 24.0
+
+    # slack ensure numeric
+    d["_Slack_LFD_days"] = pd.to_numeric(d.get("_Slack_LFD_days"), errors="coerce")
+    d["_Slack_OFD_days"] = pd.to_numeric(d.get("_Slack_OFD_days"), errors="coerce")
+    d["_Det_Slack_days"] = pd.to_numeric(d.get("_Det_Slack_days"), errors="coerce")
+
+    # Over days exact
+    d["OverDays_POL"] = d["_Slack_OFD_days"].clip(lower=0)
+    d["OverDays_POD"] = d["_Slack_LFD_days"].clip(lower=0)
+    d["OverDays_Det"] = d["_Det_Slack_days"].clip(lower=0)
+
+    # Charges per shipment (user-provided rates)
+    d["Charge_POL"] = d["OverDays_POL"] * rate_pol
+    d["Charge_POD"] = d["OverDays_POD"] * rate_pod
+    d["Charge_Det"] = d["OverDays_Det"] * rate_det
+    d["TotalCharge"] = d[["Charge_POL", "Charge_POD", "Charge_Det"]].sum(axis=1)
+
+    # Dwell computations
+    d["Dwell_max_days"] = d[["Dem_POL_days", "Dem_POD_days", "Det_POD_days"]].max(axis=1)
+    d["Dwell_leg"] = d[["Dem_POL_days", "Dem_POD_days", "Det_POD_days"]].idxmax(axis=1).map({
+        "Dem_POL_days": "POL",
+        "Dem_POD_days": "POD",
+        "Det_POD_days": "DET"
+    })
+
+    if dwell_mode.startswith("Combined"):
+        d["Dwell_flag"] = d["Dwell_max_days"] > dwell_threshold
+    else:
+        d["Dwell_flag_POL"] = d["Dem_POL_days"] > dwell_threshold
+        d["Dwell_flag_POD"] = d["Dem_POD_days"] > dwell_threshold
+        d["Dwell_flag_DET"] = d["Det_POD_days"] > dwell_threshold
+        d["Dwell_flag"] = d[["Dwell_flag_POL","Dwell_flag_POD","Dwell_flag_DET"]].any(axis=1)
+
+    # Approaching / LFD today substitutes
+    d["Approaching_LFD_flag"] = (d["_Slack_LFD_days"] >= -approach_window) & (d["_Slack_LFD_days"] < 0)
+    d["LFD_today_flag"] = (d["_Slack_LFD_days"] >= 0) & (d["_Slack_LFD_days"] < lfd_today_window)
+    d["Incurring_flag_POD"] = d["OverDays_POD"] > 0
+
+    # Aggregates for cards
+    approaching_count = int(d["Approaching_LFD_flag"].sum())
+    lfd_today_count = int(d["LFD_today_flag"].sum())
+    incurring_count = int(d["Incurring_flag_POD"].sum())
+    dwell_count = int(d["Dwell_flag"].sum())
+
+    # Charge aggregates
+    total_pol_charge = float(d["Charge_POL"].sum())
+    total_pod_charge = float(d["Charge_POD"].sum())
+    total_det_charge = float(d["Charge_Det"].sum())
+    grand_total_charge = float(d["TotalCharge"].sum())
+
+    # Render KPI cards
+    st.subheader("Control Tower Summary (historical view)")
+    k1,k2,k3,k4 = st.columns([1.2,1.0,1.0,1.0])
+    with k1:
+        st.metric("Approaching LFD (substitute)", f"{approaching_count:,d}")
+        st.caption(f"Formula: -{int(approach_window)} ≤ Slack_LFD_days < 0 (Slack_LFD_days = Dem_POD_days - FreeDays_POD)")
+    with k2:
+        st.metric("LFD today (substitute)", f"{lfd_today_count:,d}")
+        st.caption(f"Formula: 0 ≤ Slack_LFD_days < {int(lfd_today_window)}")
+    with k3:
+        st.metric("Incurring (POD) shipments", f"{incurring_count:,d}")
+        st.caption("Formula: Slack_LFD_days > 0")
+    with k4:
+        st.metric(f"Dwell > {int(dwell_threshold)} days", f"{dwell_count:,d}")
+        st.caption("Formula: max(Dem_POL_days,Dem_POD_days,Det_POD_days) > threshold")
+
+    # $ exposure row
+    c1,c2,c3,c4 = st.columns([1.0,1.0,1.0,1.0])
+    with c1:
+        st.metric("Est. Demurrage @ POL", format_money(total_pol_charge))
+        st.caption("Sum( max(0,Dem_POL_days - FreeDays_POL) * rate_POL )")
+    with c2:
+        st.metric("Est. Demurrage @ POD", format_money(total_pod_charge))
+        st.caption("Sum( max(0,Dem_POD_days - FreeDays_POD) * rate_POD )")
+    with c3:
+        st.metric("Est. Detention @ POD", format_money(total_det_charge))
+        st.caption("Sum( max(0,Det_POD_days - Det_FreeDays_POD) * rate_Det )")
+    with c4:
+        st.metric("Total estimated exposure", format_money(grand_total_charge))
+        st.caption("Aggregate estimated exposure using average rates (user input)")
+
+    # mini charts
+    st.markdown("#### Top carriers & ports by estimated exposure")
+    t1,t2 = st.columns(2)
+    with t1:
+        top_carriers = d.groupby("_Carrier")["TotalCharge"].sum().sort_values(ascending=False).head(show_top_n)
+        if len(top_carriers):
+            st.bar_chart(top_carriers)
+        else:
+            st.write("No carrier exposure to show")
+        st.caption("Top carriers by estimated exposure (sum of per-shipment estimates)")
+    with t2:
+        top_pods = d.groupby("_POD Port")["TotalCharge"].sum().sort_values(ascending=False).head(show_top_n)
+        if len(top_pods):
+            st.bar_chart(top_pods)
+        else:
+            st.write("No POD exposure to show")
+        st.caption("Top PODs by estimated exposure")
+
+    # DQ cards
+    dq1,dq2,dq3 = st.columns(3)
+    with dq1:
+        missing_gateout = int(d["_Dem_POD_hours"].isna().sum())
+        st.metric("Missing Discharge/GateOut", f"{missing_gateout:,d}")
+        st.caption("Count of rows where Dem POD can't be computed due to missing timestamps")
+    with dq2:
+        missing_gatein = int(d["_Dem_POL_hours"].isna().sum())
+        st.metric("Missing GateIn/Loaded", f"{missing_gatein:,d}")
+        st.caption("Count of rows where Dem POL can't be computed due to missing timestamps")
+    with dq3:
+        missing_det = int(d["_Det_POD_hours"].isna().sum())
+        st.metric("Missing Detention timestamps", f"{missing_det:,d}")
+        st.caption("Count of rows with missing GateOut/EmptyReturn")
+
+    # Download a small KPI summary
+    summary = {
+        "Approaching_count": approaching_count,
+        "LFD_today_count": lfd_today_count,
+        "Incurring_POD_count": incurring_count,
+        "Dwell_count": dwell_count,
+        "TotalCharge_POL": total_pol_charge,
+        "TotalCharge_POD": total_pod_charge,
+        "TotalCharge_Det": total_det_charge,
+        "GrandTotalCharge": grand_total_charge,
+    }
+    summary_df = pd.DataFrame([summary])
+    st.download_button(
+        "Download Control Tower summary (CSV)",
+        summary_df.to_csv(index=False).encode("utf-8"),
+        file_name="control_tower_summary.csv",
+        mime="text/csv",
+    )
+
+    return d
+
+# =============================================================
+# App layout (main)
+# =============================================================
+st.set_page_config(page_title="D&D Time Analyzer - Control Tower", layout="wide")
+st.title("📦 Demurrage & Detention Time Analyzer (Control Tower view)")
 
 support_msg = []
 support_msg.append("✅ .xlsx (openpyxl)" if HAS_OPENPYXL else "❌ .xlsx (install `openpyxl`)")
@@ -247,22 +415,6 @@ This app focuses **only on Demurrage & Detention time**, *not* on charges.
 - **Detention at POD** = `Gate Out` → `Empty Return`  
 
 All three are first computed in hours, then converted to **days** for display.
-
-**Slack (in _days_, + = overtime)**  
-
-We treat free days as the *allowed* time and compare the actual time:
-
-- **Slack vs LFD (Dem POD)**  
-  = `Demurrage at POD (days)` − `POD Free Days`  
-
-- **Slack vs OFD (Dem POL)**  
-  = `Demurrage at POL (days)` − `POL Free Days`  
-
-- **Detention Slack at POD**  
-  = `Detention at POD (days)` − `Detention Free Days at POD`  
-
-> Positive slack = **Over Free Days**  
-> Zero or negative slack = **Within Free Days**
 """
 )
 
@@ -387,7 +539,7 @@ with st.expander("Column Mapping", expanded=True):
             index=default_index(default_cols["empty_return"], df_raw.columns),
         )
 
-# --- Deduplicate by chosen Shipment ID ---
+# Deduplicate by chosen Shipment ID
 before_rows = len(df_raw)
 df_raw = df_raw.drop_duplicates(subset=[shipment_id_col]).reset_index(drop=True)
 after_rows = len(df_raw)
@@ -606,56 +758,67 @@ det_cov = df["_FD_DET_source"].value_counts(dropna=False).to_dict()
 st.caption(f"Detention Free Days at POD source breakdown: {det_cov}")
 
 # -------------------------------------------------------------
-# Filters
+# TOP Filters (moved above Control Tower so Control Tower is filtered)
 # -------------------------------------------------------------
 st.divider()
-st.subheader("Filters")
+st.subheader("Filters (top)")
+
+# make a working copy for filtering
+df_work = df.copy()
 
 carriers = st.multiselect(
     "Carriers",
-    sorted(df["_Carrier"].dropna().unique().tolist()),
+    sorted(df_work["_Carrier"].dropna().unique().tolist()),
     default=None,
 )
 if carriers:
-    df = df[df["_Carrier"].isin(carriers)]
+    df_work = df_work[df_work["_Carrier"].isin(carriers)]
 
 pols = st.multiselect(
     "POL Ports",
-    sorted(df["_POL Port"].dropna().unique().tolist()),
+    sorted(df_work["_POL Port"].dropna().unique().tolist()),
     default=None,
 )
 if pols:
-    df = df[df["_POL Port"].isin(pols)]
+    df_work = df_work[df_work["_POL Port"].isin(pols)]
 
 pods = st.multiselect(
     "POD Ports",
-    sorted(df["_POD Port"].dropna().unique().tolist()),
+    sorted(df_work["_POD Port"].dropna().unique().tolist()),
     default=None,
 )
 if pods:
-    df = df[df["_POD Port"].isin(pods)]
+    df_work = df_work[df_work["_POD Port"].isin(pods)]
 
-idx = df.index
+# Now call control tower using filtered df_work so cards reflect filters
+computed_df = render_control_tower(df_work)
 
-dem_pol_hours = df.loc[idx, "_Dem_POL_hours"]
-dem_pod_hours = df.loc[idx, "_Dem_POD_hours"]
-det_pod_hours = df.loc[idx, "_Det_POD_hours"]
+# -------------------------------------------------------------
+# Compute common local vars from computed_df for downstream tabs
+# -------------------------------------------------------------
+df_use = computed_df  # shorthand
 
-slack_lfd_days = df.loc[idx, "_Slack_LFD_days"]
-slack_ofd_days = df.loc[idx, "_Slack_OFD_days"]
-slack_det_days = df.loc[idx, "_Det_Slack_days"]
+idx = df_use.index
 
-shipment_ids = df.loc[idx, "_ShipmentID"]
-carrier_vals = df.loc[idx, "_Carrier"]
-pol_vals = df.loc[idx, "_POL Port"]
-pod_vals = df.loc[idx, "_POD Port"]
+dem_pol_hours = df_use.loc[idx, "_Dem_POL_hours"]
+dem_pod_hours = df_use.loc[idx, "_Dem_POD_hours"]
+det_pod_hours = df_use.loc[idx, "_Det_POD_hours"]
+
+slack_lfd_days = df_use.loc[idx, "_Slack_LFD_days"]
+slack_ofd_days = df_use.loc[idx, "_Slack_OFD_days"]
+slack_det_days = df_use.loc[idx, "_Det_Slack_days"]
+
+shipment_ids = df_use.loc[idx, "_ShipmentID"]
+carrier_vals = df_use.loc[idx, "_Carrier"]
+pol_vals = df_use.loc[idx, "_POL Port"]
+pod_vals = df_use.loc[idx, "_POD Port"]
 
 dem_pod_status = np.where(slack_lfd_days > 0, "Over Free Days", "Within Free Days")
 dem_pol_status = np.where(slack_ofd_days > 0, "Over Free Days", "Within Free Days")
 det_pod_status = np.where(slack_det_days > 0, "Over Free Days", "Within Free Days")
 
 # -------------------------------------------------------------
-# Tabs
+# Tabs (Charts, By Port & Carrier, Lanes, Explorer)
 # -------------------------------------------------------------
 tab_charts, tab_port_carrier, tab_lane, tab_ship = st.tabs(
     ["Charts", "By Port & Carrier", "By Lane (POL → POD)", "Shipment Explorer"]
@@ -667,7 +830,6 @@ tab_charts, tab_port_carrier, tab_lane, tab_ship = st.tabs(
 with tab_charts:
     st.subheader("High-level D&D Time View")
 
-    # ✅ CHANGED: top “Total” KPIs now show TOTAL SLACK (signed) in DAYS (not duration totals)
     total_slack_pod_days = slack_lfd_days.dropna().sum()
     total_slack_pol_days = slack_ofd_days.dropna().sum()
     total_slack_det_days = slack_det_days.dropna().sum()
@@ -926,6 +1088,14 @@ with tab_ship:
             "Demurrage Status at POL": dem_pol_status,
             "Demurrage Status at POD": dem_pod_status,
             "Detention Status at POD": det_pod_status,
+            # include dwell flag and charge fields if present
+            "Dwell Flag": df_use.get("Dwell_flag"),
+            "Dwell Max (days)": df_use.get("Dwell_max_days"),
+            "Dwell Leg": df_use.get("Dwell_leg"),
+            "Est Charge POL ($)": df_use.get("Charge_POL"),
+            "Est Charge POD ($)": df_use.get("Charge_POD"),
+            "Est Charge DET ($)": df_use.get("Charge_Det"),
+            "Total Est Charge ($)": df_use.get("TotalCharge"),
         }
     )
 
@@ -958,6 +1128,10 @@ with tab_ship:
         "Demurrage Status at POL",
         "Demurrage Status at POD",
         "Detention Status at POD",
+        "Dwell Flag",
+        "Dwell Max (days)",
+        "Dwell Leg",
+        "Total Est Charge ($)",
     ]
 
     st.dataframe(explorer_df[show_cols], use_container_width=True)
@@ -970,13 +1144,8 @@ with tab_ship:
     )
 
 # =============================================================
-# Overtime Drilldown Add-on (requested features)
-# - Histogram: over-days (ceil buckets) vs shipment count (slack > 0)
-# - Filters: metric + bucket + carrier/port
-# - Show count of shipments in selected bucket
-# - Downloads REMOVE duration cols and include ALL THREE over-days cols
+# Overtime Drilldown (unchanged behavior)
 # =============================================================
-
 st.divider()
 st.header("Overtime Drilldown (pick a metric + days-over bucket)")
 
@@ -988,94 +1157,89 @@ metric_map = {
 metric_choice = st.selectbox("Metric", list(metric_map.keys()), index=0)
 slack_col, side = metric_map[metric_choice]
 
-slack_series = pd.to_numeric(df[slack_col], errors="coerce")
-overtime_all = df[slack_series > 0].copy()
+slack_series = pd.to_numeric(df_use[slack_col], errors="coerce")
+overtime_all = df_use[slack_series > 0].copy()
 
 if overtime_all.empty:
     st.info("No overtime shipments (slack > 0) for the selected metric.")
-    st.stop()
+else:
+    bucket_series = np.ceil(pd.to_numeric(overtime_all[slack_col], errors="coerce")).astype(int)
+    hist = bucket_series.value_counts().sort_index()
+    hist_df = pd.DataFrame({"Over Days": hist.index.astype(int), "Shipments": hist.values})
 
-bucket_series = np.ceil(pd.to_numeric(overtime_all[slack_col], errors="coerce")).astype(int)
-hist = bucket_series.value_counts().sort_index()
-hist_df = pd.DataFrame({"Over Days": hist.index.astype(int), "Shipments": hist.values})
+    st.subheader("Overtime distribution (selected metric)")
+    st.caption("X = days over (ceil), Y = # shipments (only slack > 0).")
+    st.bar_chart(hist_df.set_index("Over Days"))
 
-st.subheader("Overtime distribution (selected metric)")
-st.caption("X = days over (ceil), Y = # shipments (only slack > 0).")
-st.bar_chart(hist_df.set_index("Over Days"))
+    available_buckets = hist_df["Over Days"].tolist()
+    selected_bucket = st.selectbox("Show shipments over by (days)", available_buckets, index=0)
 
-available_buckets = hist_df["Over Days"].tolist()
-selected_bucket = st.selectbox("Show shipments over by (days)", available_buckets, index=0)
+    lo, hi = selected_bucket - 1, selected_bucket
+    sl = pd.to_numeric(overtime_all[slack_col], errors="coerce")
+    drill = overtime_all[(sl > lo) & (sl <= hi)].copy()
 
-lo, hi = selected_bucket - 1, selected_bucket
-sl = pd.to_numeric(overtime_all[slack_col], errors="coerce")
-drill = overtime_all[(sl > lo) & (sl <= hi)].copy()
+    st.caption("Optional drill filters (defaults to All):")
+    f1, f2 = st.columns(2)
 
-st.caption("Optional drill filters (defaults to All):")
-f1, f2 = st.columns(2)
+    with f1:
+        carrier_order = drill["_Carrier"].value_counts().index.tolist()
+        carrier_pick = st.multiselect("Carrier (top volume first)", carrier_order, default=None)
 
-with f1:
-    carrier_order = drill["_Carrier"].value_counts().index.tolist()
-    carrier_pick = st.multiselect("Carrier (top volume first)", carrier_order, default=None)
+    with f2:
+        if side == "POL":
+            port_order = drill["_POL Port"].value_counts().index.tolist()
+            port_pick = st.multiselect("POL Port (top volume first)", port_order, default=None)
+        else:
+            port_order = drill["_POD Port"].value_counts().index.tolist()
+            port_pick = st.multiselect("POD Port (top volume first)", port_order, default=None)
 
-with f2:
-    if side == "POL":
-        port_order = drill["_POL Port"].value_counts().index.tolist()
-        port_pick = st.multiselect("POL Port (top volume first)", port_order, default=None)
-    else:
-        port_order = drill["_POD Port"].value_counts().index.tolist()
-        port_pick = st.multiselect("POD Port (top volume first)", port_order, default=None)
+    if carrier_pick:
+        drill = drill[drill["_Carrier"].isin(carrier_pick)]
+    if port_pick:
+        if side == "POL":
+            drill = drill[drill["_POL Port"].isin(port_pick)]
+        else:
+            drill = drill[drill["_POD Port"].isin(port_pick)]
 
-if carrier_pick:
-    drill = drill[drill["_Carrier"].isin(carrier_pick)]
-if port_pick:
-    if side == "POL":
-        drill = drill[drill["_POL Port"].isin(port_pick)]
-    else:
-        drill = drill[drill["_POD Port"].isin(port_pick)]
+    total_overtime_shipments = int(overtime_all["_ShipmentID"].nunique())
+    bucket_shipments = int(drill["_ShipmentID"].nunique())
 
-total_overtime_shipments = overtime_all["_ShipmentID"].nunique()
-bucket_shipments = drill["_ShipmentID"].nunique()
+    c1, c2 = st.columns(2)
+    with c1:
+        st.metric("Shipments in selected bucket", f"{bucket_shipments:,}")
+    with c2:
+        st.metric("Total overtime shipments (metric)", f"{total_overtime_shipments:,}")
 
-c1, c2 = st.columns(2)
-with c1:
-    st.metric("Shipments in selected bucket", f"{bucket_shipments:,}")
-with c2:
-    st.metric("Total overtime shipments (metric)", f"{total_overtime_shipments:,}")
+    def build_overtime_table(df_in: pd.DataFrame) -> pd.DataFrame:
+        out = pd.DataFrame({
+            "Shipment ID": df_in["_ShipmentID"],
+            "Carrier": df_in["_Carrier"],
+            "POL Port": df_in["_POL Port"],
+            "POD Port": df_in["_POD Port"],
+            "Over Days - Demurrage POL": over_days(df_in["_Slack_OFD_days"]).round(4),
+            "Over Days - Demurrage POD": over_days(df_in["_Slack_LFD_days"]).round(4),
+            "Over Days - Detention POD": over_days(df_in["_Det_Slack_days"]).round(4),
+        })
+        out["Over Free Days"] = pd.to_numeric(df_in[slack_col], errors="coerce").round(4)
+        out["Over Free Days Bucket"] = np.ceil(pd.to_numeric(df_in[slack_col], errors="coerce")).astype("Int64")
+        return out
 
-def build_overtime_table(df_in: pd.DataFrame) -> pd.DataFrame:
-    out = pd.DataFrame({
-        "Shipment ID": df_in["_ShipmentID"],
-        "Carrier": df_in["_Carrier"],
-        "POL Port": df_in["_POL Port"],
-        "POD Port": df_in["_POD Port"],
+    drill_view = build_overtime_table(drill).sort_values("Over Free Days", ascending=False)
+    st.dataframe(drill_view, use_container_width=True)
 
-        # ALL THREE over-days columns requested
-        "Over Days - Demurrage POL": over_days(df_in["_Slack_OFD_days"]).round(4),
-        "Over Days - Demurrage POD": over_days(df_in["_Slack_LFD_days"]).round(4),
-        "Over Days - Detention POD": over_days(df_in["_Det_Slack_days"]).round(4),
-    })
+    st.download_button(
+        "Download selected bucket shipments (CSV)",
+        drill_view.to_csv(index=False).encode("utf-8"),
+        file_name="dd_overtime_selected_bucket_shipments.csv",
+        mime="text/csv",
+    )
 
-    # Requested column: how many days over for SELECTED METRIC (signed)
-    out["Over Free Days"] = pd.to_numeric(df_in[slack_col], errors="coerce").round(4)
-    out["Over Free Days Bucket"] = np.ceil(pd.to_numeric(df_in[slack_col], errors="coerce")).astype("Int64")
-    return out
+    st.subheader("All shipments above free days (selected metric)")
+    overtime_all_view = build_overtime_table(overtime_all).sort_values("Over Free Days", ascending=False)
 
-drill_view = build_overtime_table(drill).sort_values("Over Free Days", ascending=False)
-st.dataframe(drill_view, use_container_width=True)
-
-st.download_button(
-    "Download selected bucket shipments (CSV)",
-    drill_view.to_csv(index=False).encode("utf-8"),
-    file_name="dd_overtime_selected_bucket_shipments.csv",
-    mime="text/csv",
-)
-
-st.subheader("All shipments above free days (selected metric)")
-overtime_all_view = build_overtime_table(overtime_all).sort_values("Over Free Days", ascending=False)
-
-st.download_button(
-    "Download ALL shipments above free days (selected metric) (CSV)",
-    overtime_all_view.to_csv(index=False).encode("utf-8"),
-    file_name="dd_overtime_all_shipments_selected_metric.csv",
-    mime="text/csv",
-)
+    st.download_button(
+        "Download ALL shipments above free days (selected metric) (CSV)",
+        overtime_all_view.to_csv(index=False).encode("utf-8"),
+        file_name="dd_overtime_all_shipments_selected_metric.csv",
+        mime="text/csv",
+    )
