@@ -3,6 +3,8 @@
 # - Control Tower top row shows High-level Slack KPIs (from old Charts tab)
 # - Remove those Slack KPIs from Charts tab
 # - Keep Dwell + Estimated Exposure in Control Tower
+# - Hide Column Mapping + Settings UI and lock current defaults
+# - Add Business Days option for Detention at POD – Free Days
 
 import pandas as pd
 import numpy as np
@@ -402,7 +404,7 @@ else:
 df_raw = normalize_columns(df_raw)
 
 # -------------------------------------------------------------
-# Column Mapping
+# Locked default Column Mapping (hidden from UI)
 # -------------------------------------------------------------
 default_cols = {
     "shipment_id": find_col(df_raw, ["Container Number", "Container No", "Container_No", "Container", "Cntr No", "Shipment ID", "BOL", "Bill of Lading"]),
@@ -416,28 +418,31 @@ default_cols = {
     "pod": find_col(df_raw, ["POD Port", "POD", "Port of Discharge", "POD Name", "Destination Port"]),
 }
 
-with st.expander("Column Mapping", expanded=True):
-    c1, c2 = st.columns(2)
-    with c1:
-        shipment_id_col = st.selectbox("Shipment ID (e.g., BOL or Container)", df_raw.columns,
-                                       index=default_index(default_cols["shipment_id"], df_raw.columns))
-        carrier_col = st.selectbox("Carrier column", df_raw.columns,
-                                   index=default_index(default_cols["carrier"], df_raw.columns))
-        pol_col = st.selectbox("POL (Port of Loading) column", df_raw.columns,
-                               index=default_index(default_cols["pol"], df_raw.columns))
-        gate_in_col = st.selectbox("2-Gate In Timestamp", df_raw.columns,
-                                   index=default_index(default_cols["gate_in"], df_raw.columns))
-        container_loaded_col = st.selectbox("3-Container Loaded Timestamp", df_raw.columns,
-                                            index=default_index(default_cols["container_loaded"], df_raw.columns))
-    with c2:
-        pod_col = st.selectbox("POD (Port of Discharge) column", df_raw.columns,
-                               index=default_index(default_cols["pod"], df_raw.columns))
-        discharge_col = st.selectbox("6-Container Discharge Timestamp", df_raw.columns,
-                                     index=default_index(default_cols["discharge"], df_raw.columns))
-        gate_out_col = st.selectbox("7-Gate Out Timestamp", df_raw.columns,
-                                    index=default_index(default_cols["gate_out"], df_raw.columns))
-        empty_return_col = st.selectbox("8-Empty Return Timestamp", df_raw.columns,
-                                        index=default_index(default_cols["empty_return"], df_raw.columns))
+required_defaults = {
+    "Shipment ID": default_cols["shipment_id"],
+    "Carrier": default_cols["carrier"],
+    "POL": default_cols["pol"],
+    "POD": default_cols["pod"],
+    "2-Gate In Timestamp": default_cols["gate_in"],
+    "3-Container Loaded Timestamp": default_cols["container_loaded"],
+    "6-Container Discharge Timestamp": default_cols["discharge"],
+    "7-Gate Out Timestamp": default_cols["gate_out"],
+    "8-Empty Return Timestamp": default_cols["empty_return"],
+}
+missing_defaults = [label for label, col in required_defaults.items() if col is None]
+if missing_defaults:
+    st.error("Required default columns were not found in the uploaded file: " + ", ".join(missing_defaults))
+    st.stop()
+
+shipment_id_col = default_cols["shipment_id"]
+carrier_col = default_cols["carrier"]
+pol_col = default_cols["pol"]
+pod_col = default_cols["pod"]
+gate_in_col = default_cols["gate_in"]
+container_loaded_col = default_cols["container_loaded"]
+discharge_col = default_cols["discharge"]
+gate_out_col = default_cols["gate_out"]
+empty_return_col = default_cols["empty_return"]
 
 # Deduplicate
 before_rows = len(df_raw)
@@ -447,20 +452,12 @@ if after_rows < before_rows:
     st.info(f"Deduplicated by Shipment ID '{shipment_id_col}': removed {before_rows - after_rows} duplicate rows.")
 
 # -------------------------------------------------------------
-# Settings
+# Locked default Settings (hidden from UI)
 # -------------------------------------------------------------
-st.divider()
-st.subheader("Settings")
-
-dayfirst = st.checkbox("Dates are day-first (DD/MM/YYYY)", value=True)
+dayfirst = True
 unit_factor = 1.0 / 24.0
 unit_label = "days"
-
-neg_policy = st.selectbox(
-    "Milestone durations: negatives",
-    ["Treat as NaN (drop from stats)", "Keep (could be data issue)"],
-    index=0,
-)
+neg_policy = "Treat as NaN (drop from stats)"
 
 # -------------------------------------------------------------
 # Compute milestone durations
@@ -549,10 +546,12 @@ st.caption(f"POL Free Days source breakdown: {df['_FD_POL_source'].value_counts(
 
 # Detention
 st.markdown("### Detention at POD – Free Days")
-c1, c2 = st.columns([1, 2])
+c1, c2, c3 = st.columns([1, 1, 2])
 with c1:
     default_free_days_det = st.number_input("Default Detention Free Days at POD", 0, 60, 0, 1)
 with c2:
+    business_days_det = st.checkbox("Detention free days use Business Days?", value=False)
+with c3:
     det_map_pod_file = st.file_uploader("Optional Detention Free Days mapping CSV", type=["csv"], key="detmap")
 
 det_mapper = None
@@ -565,6 +564,7 @@ if det_map_pod_file is not None:
         st.warning(f"Could not read Detention mapping CSV: {e}")
 
 df["_Det_FreeDays_POD"], df["_FD_DET_source"] = apply_free_days(df, "_Carrier", "_POD Port", default_free_days_det, det_mapper, "POD")
+df["_Estimated_Detention_Due"] = add_days_eod_vector(gate_out_dt, df["_Det_FreeDays_POD"], business_days_det)
 df["_Det_Slack_days"] = (df["_Det_POD_hours"] / 24.0) - df["_Det_FreeDays_POD"]
 st.caption(f"Detention Free Days at POD source breakdown: {df['_FD_DET_source'].value_counts(dropna=False).to_dict()}")
 
