@@ -289,17 +289,17 @@ def render_control_tower(df: pd.DataFrame, unit_label: str = "days"):
         d["Dwell_flag"] = d[["Dwell_flag_POL", "Dwell_flag_POD", "Dwell_flag_DET"]].any(axis=1)
 
     # ---- SIMPLE EXPOSURE MATH ----
-    # POL demurrage exposure = Total Slack vs OFD at POL × Avg demurrage rate @ POL
-    # POD demurrage exposure = Total Slack vs LFD at POD × Avg demurrage rate @ POD
+    # POL demurrage exposure = max(Total Slack vs OFD at POL, 0) × Avg demurrage rate @ POL
+    # POD demurrage exposure = max(Total Slack vs LFD at POD, 0) × Avg demurrage rate @ POD
     # POD detention exposure = max(Total Detention Slack at POD, 0) × Avg detention rate @ POD
-    total_pol_charge = float(total_slack_pol_days * rate_pol)
-    total_pod_charge = float(total_slack_pod_days * rate_pod)
+    total_pol_charge = float(max(total_slack_pol_days, 0) * rate_pol)
+    total_pod_charge = float(max(total_slack_pod_days, 0) * rate_pod)
     total_det_charge = float(max(total_slack_det_days, 0) * rate_det)
     grand_total_charge = float(total_pol_charge + total_pod_charge + total_det_charge)
 
     # Keep row-level charges for Shipment Explorer / downstream display
-    d["Charge_POL"] = pd.to_numeric(d["_Slack_OFD_days"], errors="coerce") * rate_pol
-    d["Charge_POD"] = pd.to_numeric(d["_Slack_LFD_days"], errors="coerce") * rate_pod
+    d["Charge_POL"] = pd.to_numeric(d["_Slack_OFD_days"], errors="coerce").clip(lower=0) * rate_pol
+    d["Charge_POD"] = pd.to_numeric(d["_Slack_LFD_days"], errors="coerce").clip(lower=0) * rate_pod
     d["Charge_Det"] = pd.to_numeric(d["_Det_Slack_days"], errors="coerce").clip(lower=0) * rate_det
     d["TotalCharge"] = d[["Charge_POL", "Charge_POD", "Charge_Det"]].sum(axis=1)
 
@@ -307,10 +307,10 @@ def render_control_tower(df: pd.DataFrame, unit_label: str = "days"):
     r2c1, r2c2, r2c3, r2c4 = st.columns(4)
     with r2c1:
         st.metric("Est. Demurrage @ POL", format_money(total_pol_charge))
-        st.caption("Formula: Total Slack vs OFD at POL × Avg demurrage rate @ POL")
+        st.caption("Formula: max(Total Slack vs OFD at POL, 0) × Avg demurrage rate @ POL")
     with r2c2:
         st.metric("Est. Demurrage @ POD", format_money(total_pod_charge))
-        st.caption("Formula: Total Slack vs LFD at POD × Avg demurrage rate @ POD")
+        st.caption("Formula: max(Total Slack vs LFD at POD, 0) × Avg demurrage rate @ POD")
     with r2c3:
         st.metric("Est. Detention @ POD", format_money(total_det_charge))
         st.caption("Formula: max(Total Detention Slack at POD, 0) × Avg detention rate @ POD")
@@ -324,8 +324,8 @@ def render_control_tower(df: pd.DataFrame, unit_label: str = "days"):
         top_carriers = (
             d.groupby("_Carrier")
             .apply(
-                lambda g: (pd.to_numeric(g["_Slack_OFD_days"], errors="coerce").sum() * rate_pol)
-                + (pd.to_numeric(g["_Slack_LFD_days"], errors="coerce").sum() * rate_pod)
+                lambda g: (max(pd.to_numeric(g["_Slack_OFD_days"], errors="coerce").sum(), 0) * rate_pol)
+                + (max(pd.to_numeric(g["_Slack_LFD_days"], errors="coerce").sum(), 0) * rate_pod)
                 + (max(pd.to_numeric(g["_Det_Slack_days"], errors="coerce").sum(), 0) * rate_det)
             )
             .sort_values(ascending=False)
@@ -339,8 +339,8 @@ def render_control_tower(df: pd.DataFrame, unit_label: str = "days"):
         top_pods = (
             d.groupby("_POD Port")
             .apply(
-                lambda g: (pd.to_numeric(g["_Slack_OFD_days"], errors="coerce").sum() * rate_pol)
-                + (pd.to_numeric(g["_Slack_LFD_days"], errors="coerce").sum() * rate_pod)
+                lambda g: (max(pd.to_numeric(g["_Slack_OFD_days"], errors="coerce").sum(), 0) * rate_pol)
+                + (max(pd.to_numeric(g["_Slack_LFD_days"], errors="coerce").sum(), 0) * rate_pod)
                 + (max(pd.to_numeric(g["_Det_Slack_days"], errors="coerce").sum(), 0) * rate_det)
             )
             .sort_values(ascending=False)
