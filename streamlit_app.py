@@ -1,11 +1,3 @@
-# dd_time_analyzer_control_tower.py
-# Full updated Streamlit app:
-# - Control Tower top row shows High-level Slack KPIs (from old Charts tab)
-# - Remove those Slack KPIs from Charts tab
-# - Keep Dwell + Estimated Exposure in Control Tower
-# - Hide Column Mapping + Settings UI and lock current defaults
-# - Add Business Days option for Detention at POD – Free Days
-
 import pandas as pd
 import numpy as np
 from io import BytesIO
@@ -227,8 +219,9 @@ def format_money(x):
 def render_control_tower(df: pd.DataFrame, unit_label: str = "days"):
     """
     Control Tower:
-      - TOP ROW: High-level Slack KPIs (moved from Charts tab)
-      - SECOND ROW: Dwell + Estimated Exposure KPIs
+      - TOP ROW: High-level Slack KPIs (from old Charts tab)
+      - SECOND ROW: Simple exposure KPIs based on total slack × selected rate
+      - Dwell KPI removed from summary
       - Mini charts: Top carriers/ports by exposure
     Returns: computed df (copy) with extra computed cols.
     """
@@ -275,19 +268,10 @@ def render_control_tower(df: pd.DataFrame, unit_label: str = "days"):
         st.metric(f"Total Detention Slack at POD ({unit_label})", f"{total_slack_det_days:,.2f}")
         st.metric(f"Avg Detention Slack at POD ({unit_label})", f"{avg_slack_det_days:,.2f}")
 
-    # ---- Dwell + Charges (kept) ----
+    # ---- Keep dwell fields for downstream views, but remove dwell KPI from Control Tower summary ----
     d["Dem_POL_days"] = pd.to_numeric(d.get("_Dem_POL_hours"), errors="coerce") / 24.0
     d["Dem_POD_days"] = pd.to_numeric(d.get("_Dem_POD_hours"), errors="coerce") / 24.0
     d["Det_POD_days"] = pd.to_numeric(d.get("_Det_POD_hours"), errors="coerce") / 24.0
-
-    d["OverDays_POL"] = d["_Slack_OFD_days"].clip(lower=0)
-    d["OverDays_POD"] = d["_Slack_LFD_days"].clip(lower=0)
-    d["OverDays_Det"] = d["_Det_Slack_days"].clip(lower=0)
-
-    d["Charge_POL"] = d["OverDays_POL"] * rate_pol
-    d["Charge_POD"] = d["OverDays_POD"] * rate_pod
-    d["Charge_Det"] = d["OverDays_Det"] * rate_det
-    d["TotalCharge"] = d[["Charge_POL", "Charge_POD", "Charge_Det"]].sum(axis=1)
 
     d["Dwell_max_days"] = d[["Dem_POL_days", "Dem_POD_days", "Det_POD_days"]].max(axis=1)
     d["Dwell_leg"] = d[["Dem_POL_days", "Dem_POD_days", "Det_POD_days"]].idxmax(axis=1).map({
@@ -304,42 +288,64 @@ def render_control_tower(df: pd.DataFrame, unit_label: str = "days"):
         d["Dwell_flag_DET"] = d["Det_POD_days"] > dwell_threshold
         d["Dwell_flag"] = d[["Dwell_flag_POL", "Dwell_flag_POD", "Dwell_flag_DET"]].any(axis=1)
 
-    dwell_count = int(d["Dwell_flag"].sum())
+    # ---- SIMPLE EXPOSURE MATH ----
+    # POL demurrage exposure = Total Slack vs OFD at POL × Avg demurrage rate @ POL
+    # POD demurrage exposure = Total Slack vs LFD at POD × Avg demurrage rate @ POD
+    # POD detention exposure = max(Total Detention Slack at POD, 0) × Avg detention rate @ POD
+    total_pol_charge = float(total_slack_pol_days * rate_pol)
+    total_pod_charge = float(total_slack_pod_days * rate_pod)
+    total_det_charge = float(max(total_slack_det_days, 0) * rate_det)
+    grand_total_charge = float(total_pol_charge + total_pod_charge + total_det_charge)
 
-    total_pol_charge = float(d["Charge_POL"].sum())
-    total_pod_charge = float(d["Charge_POD"].sum())
-    total_det_charge = float(d["Charge_Det"].sum())
-    grand_total_charge = float(d["TotalCharge"].sum())
+    # Keep row-level charges for Shipment Explorer / downstream display
+    d["Charge_POL"] = pd.to_numeric(d["_Slack_OFD_days"], errors="coerce") * rate_pol
+    d["Charge_POD"] = pd.to_numeric(d["_Slack_LFD_days"], errors="coerce") * rate_pod
+    d["Charge_Det"] = pd.to_numeric(d["_Det_Slack_days"], errors="coerce").clip(lower=0) * rate_det
+    d["TotalCharge"] = d[["Charge_POL", "Charge_POD", "Charge_Det"]].sum(axis=1)
 
-    # Row: Dwell + Exposure (matches the "control tower" feel)
+    # Row: Exposure only
     r2c1, r2c2, r2c3, r2c4 = st.columns(4)
     with r2c1:
-        st.metric(f"Dwell > {int(dwell_threshold)} days", f"{dwell_count:,d}")
-        st.caption("Formula: max(Dem_POL_days, Dem_POD_days, Det_POD_days) > threshold")
-    with r2c2:
         st.metric("Est. Demurrage @ POL", format_money(total_pol_charge))
-        st.caption("Sum(max(0, Dem_POL_days - FreeDays_POL) * rate_POL)")
-    with r2c3:
+        st.caption("Formula: Total Slack vs OFD at POL × Avg demurrage rate @ POL")
+    with r2c2:
         st.metric("Est. Demurrage @ POD", format_money(total_pod_charge))
-        st.caption("Sum(max(0, Dem_POD_days - FreeDays_POD) * rate_POD)")
+        st.caption("Formula: Total Slack vs LFD at POD × Avg demurrage rate @ POD")
+    with r2c3:
+        st.metric("Est. Detention @ POD", format_money(total_det_charge))
+        st.caption("Formula: max(Total Detention Slack at POD, 0) × Avg detention rate @ POD")
     with r2c4:
         st.metric("Total estimated exposure", format_money(grand_total_charge))
-        st.caption("Aggregate estimated exposure using average rates (user input)")
-
-    # Optional: keep detention exposure visible (since it’s important)
-    st.metric("Est. Detention @ POD", format_money(total_det_charge))
-    st.caption("Sum(max(0, Det_POD_days - Det_FreeDays_POD) * rate_Det)")
+        st.caption("Sum of POL demurrage + POD demurrage + POD detention exposure")
 
     st.markdown("#### Top carriers & POD ports by estimated exposure")
     t1, t2 = st.columns(2)
     with t1:
-        top_carriers = d.groupby("_Carrier")["TotalCharge"].sum().sort_values(ascending=False).head(show_top_n)
+        top_carriers = (
+            d.groupby("_Carrier")
+            .apply(
+                lambda g: (pd.to_numeric(g["_Slack_OFD_days"], errors="coerce").sum() * rate_pol)
+                + (pd.to_numeric(g["_Slack_LFD_days"], errors="coerce").sum() * rate_pod)
+                + (max(pd.to_numeric(g["_Det_Slack_days"], errors="coerce").sum(), 0) * rate_det)
+            )
+            .sort_values(ascending=False)
+            .head(show_top_n)
+        )
         if len(top_carriers):
             st.bar_chart(top_carriers)
         else:
             st.write("No carrier exposure to show")
     with t2:
-        top_pods = d.groupby("_POD Port")["TotalCharge"].sum().sort_values(ascending=False).head(show_top_n)
+        top_pods = (
+            d.groupby("_POD Port")
+            .apply(
+                lambda g: (pd.to_numeric(g["_Slack_OFD_days"], errors="coerce").sum() * rate_pol)
+                + (pd.to_numeric(g["_Slack_LFD_days"], errors="coerce").sum() * rate_pod)
+                + (max(pd.to_numeric(g["_Det_Slack_days"], errors="coerce").sum(), 0) * rate_det)
+            )
+            .sort_values(ascending=False)
+            .head(show_top_n)
+        )
         if len(top_pods):
             st.bar_chart(top_pods)
         else:
