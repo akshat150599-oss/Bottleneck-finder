@@ -220,9 +220,9 @@ def render_control_tower(df: pd.DataFrame, unit_label: str = "days"):
     """
     Control Tower:
       - TOP ROW: High-level Slack KPIs (from old Charts tab)
-      - SECOND ROW: Simple exposure KPIs based on total slack × selected rate
+      - SECOND ROW: Simple exposure KPIs based on total slack x selected rate
       - Dwell KPI removed from summary
-      - Mini charts: Top carriers/ports by exposure
+      - Bar charts removed from Control Tower
     Returns: computed df (copy) with extra computed cols.
     """
     st.divider()
@@ -256,7 +256,6 @@ def render_control_tower(df: pd.DataFrame, unit_label: str = "days"):
 
     st.subheader("Control Tower Summary (historical view)")
 
-    # Show like screenshot-2: totals + avgs grouped by metric
     r1c1, r1c2, r1c3 = st.columns(3)
     with r1c1:
         st.metric(f"Total Slack vs LFD at POD ({unit_label})", f"{total_slack_pod_days:,.2f}")
@@ -268,7 +267,7 @@ def render_control_tower(df: pd.DataFrame, unit_label: str = "days"):
         st.metric(f"Total Detention Slack at POD ({unit_label})", f"{total_slack_det_days:,.2f}")
         st.metric(f"Avg Detention Slack at POD ({unit_label})", f"{avg_slack_det_days:,.2f}")
 
-    # ---- Keep dwell fields for downstream views, but remove dwell KPI from Control Tower summary ----
+    # ---- Keep dwell fields for downstream views ----
     d["Dem_POL_days"] = pd.to_numeric(d.get("_Dem_POL_hours"), errors="coerce") / 24.0
     d["Dem_POD_days"] = pd.to_numeric(d.get("_Dem_POD_hours"), errors="coerce") / 24.0
     d["Det_POD_days"] = pd.to_numeric(d.get("_Det_POD_hours"), errors="coerce") / 24.0
@@ -289,68 +288,31 @@ def render_control_tower(df: pd.DataFrame, unit_label: str = "days"):
         d["Dwell_flag"] = d[["Dwell_flag_POL", "Dwell_flag_POD", "Dwell_flag_DET"]].any(axis=1)
 
     # ---- SIMPLE EXPOSURE MATH ----
-    # POL demurrage exposure = max(Total Slack vs OFD at POL, 0) × Avg demurrage rate @ POL
-    # POD demurrage exposure = max(Total Slack vs LFD at POD, 0) × Avg demurrage rate @ POD
-    # POD detention exposure = max(Total Detention Slack at POD, 0) × Avg detention rate @ POD
     total_pol_charge = float(max(total_slack_pol_days, 0) * rate_pol)
     total_pod_charge = float(max(total_slack_pod_days, 0) * rate_pod)
     total_det_charge = float(max(total_slack_det_days, 0) * rate_det)
     grand_total_charge = float(total_pol_charge + total_pod_charge + total_det_charge)
 
-    # Keep row-level charges for Shipment Explorer / downstream display
     d["Charge_POL"] = pd.to_numeric(d["_Slack_OFD_days"], errors="coerce").clip(lower=0) * rate_pol
     d["Charge_POD"] = pd.to_numeric(d["_Slack_LFD_days"], errors="coerce").clip(lower=0) * rate_pod
     d["Charge_Det"] = pd.to_numeric(d["_Det_Slack_days"], errors="coerce").clip(lower=0) * rate_det
     d["TotalCharge"] = d[["Charge_POL", "Charge_POD", "Charge_Det"]].sum(axis=1)
 
-    # Row: Exposure only
     r2c1, r2c2, r2c3, r2c4 = st.columns(4)
     with r2c1:
         st.metric("Est. Demurrage @ POL", format_money(total_pol_charge))
-        st.caption("Formula: max(Total Slack vs OFD at POL, 0) × Avg demurrage rate @ POL")
+        st.caption("Formula: max(Total Slack vs OFD at POL, 0) x Avg demurrage rate @ POL")
     with r2c2:
         st.metric("Est. Demurrage @ POD", format_money(total_pod_charge))
-        st.caption("Formula: max(Total Slack vs LFD at POD, 0) × Avg demurrage rate @ POD")
+        st.caption("Formula: max(Total Slack vs LFD at POD, 0) x Avg demurrage rate @ POD")
     with r2c3:
         st.metric("Est. Detention @ POD", format_money(total_det_charge))
-        st.caption("Formula: max(Total Detention Slack at POD, 0) × Avg detention rate @ POD")
+        st.caption("Formula: max(Total Detention Slack at POD, 0) x Avg detention rate @ POD")
     with r2c4:
         st.metric("Total estimated exposure", format_money(grand_total_charge))
         st.caption("Sum of POL demurrage + POD demurrage + POD detention exposure")
 
-    st.markdown("#### Top carriers & POD ports by estimated exposure")
-    t1, t2 = st.columns(2)
-    with t1:
-        top_carriers = (
-            d.groupby("_Carrier")
-            .apply(
-                lambda g: (max(pd.to_numeric(g["_Slack_OFD_days"], errors="coerce").sum(), 0) * rate_pol)
-                + (max(pd.to_numeric(g["_Slack_LFD_days"], errors="coerce").sum(), 0) * rate_pod)
-                + (max(pd.to_numeric(g["_Det_Slack_days"], errors="coerce").sum(), 0) * rate_det)
-            )
-            .sort_values(ascending=False)
-            .head(show_top_n)
-        )
-        if len(top_carriers):
-            st.bar_chart(top_carriers)
-        else:
-            st.write("No carrier exposure to show")
-    with t2:
-        top_pods = (
-            d.groupby("_POD Port")
-            .apply(
-                lambda g: (max(pd.to_numeric(g["_Slack_OFD_days"], errors="coerce").sum(), 0) * rate_pol)
-                + (max(pd.to_numeric(g["_Slack_LFD_days"], errors="coerce").sum(), 0) * rate_pod)
-                + (max(pd.to_numeric(g["_Det_Slack_days"], errors="coerce").sum(), 0) * rate_det)
-            )
-            .sort_values(ascending=False)
-            .head(show_top_n)
-        )
-        if len(top_pods):
-            st.bar_chart(top_pods)
-        else:
-            st.write("No POD exposure to show")
-
+    # CHANGE 1: Bar charts removed from Control Tower — return d directly
     return d
 
 # =============================================================
@@ -628,7 +590,7 @@ tab_charts, tab_port_carrier, tab_lane, tab_ship = st.tabs(
 )
 
 # ============================
-# TAB 1: Charts (REMOVED the Slack KPI blocks)
+# TAB 1: Charts
 # ============================
 with tab_charts:
     st.subheader("High-level D&D Time View")
@@ -646,15 +608,20 @@ with tab_charts:
         st.write(slack_det_days.describe())
 
 # ============================
-# TAB 2: By Port & Carrier
+# TAB 2: By Port & Carrier — CHANGE 2: horizontal bar charts added
 # ============================
 with tab_port_carrier:
     st.subheader("By Port & Carrier")
+    top_n_bar = st.slider("Show Top N entries", min_value=5, max_value=30, value=10, step=5)
 
+    # ---- Demurrage at POD ----
     st.markdown("### Demurrage at POD (Discharge → Gate Out)")
-    dem_pod_df = pd.DataFrame(
-        {"POD Port": pod_vals, "Carrier": carrier_vals, "Dem_POD_hours": dem_pod_hours, "Slack_LFD_days": slack_lfd_days}
-    )
+    dem_pod_df = pd.DataFrame({
+        "POD Port": pod_vals,
+        "Carrier": carrier_vals,
+        "Dem_POD_hours": dem_pod_hours,
+        "Slack_LFD_days": slack_lfd_days
+    })
 
     dem_pod_summary = (
         dem_pod_df.groupby(["POD Port", "Carrier"])
@@ -667,28 +634,41 @@ with tab_port_carrier:
         )
         .reset_index()
     )
-
     slack_pod_summary = (
         dem_pod_df.groupby(["POD Port", "Carrier"])["Slack_LFD_days"]
-        .apply(slack_group_stats)
-        .unstack()
-        .reset_index()
+        .apply(slack_group_stats).unstack().reset_index()
     )
-
     dem_pod_merged = dem_pod_summary.merge(slack_pod_summary, on=["POD Port", "Carrier"], how="left")
-    st.dataframe(dem_pod_merged, use_container_width=True)
-    st.download_button(
-        "Download Demurrage POD by POD+Carrier (CSV)",
-        dem_pod_merged.to_csv(index=False).encode("utf-8"),
-        file_name="demurrage_pod_by_pod_carrier.csv",
-        mime="text/csv",
+
+    chart_pod = (
+        dem_pod_merged
+        .assign(Label=dem_pod_merged["POD Port"] + " | " + dem_pod_merged["Carrier"])
+        .nlargest(top_n_bar, "Total_Dem_Days")
+        .set_index("Label")[["Total_Dem_Days"]]
+        .sort_values("Total_Dem_Days")
     )
+    st.markdown(f"#### Top {top_n_bar} Port+Carrier combos by Total Demurrage Days (POD)")
+    st.bar_chart(chart_pod, horizontal=True)
+
+    with st.expander("View full table — Demurrage POD"):
+        st.dataframe(dem_pod_merged, use_container_width=True)
+        st.download_button(
+            "Download Demurrage POD by POD+Carrier (CSV)",
+            dem_pod_merged.to_csv(index=False).encode("utf-8"),
+            file_name="demurrage_pod_by_pod_carrier.csv",
+            mime="text/csv",
+        )
 
     st.divider()
+
+    # ---- Demurrage at POL ----
     st.markdown("### Demurrage at POL (Gate In → Container Loaded)")
-    dem_pol_df = pd.DataFrame(
-        {"POL Port": pol_vals, "Carrier": carrier_vals, "Dem_POL_hours": dem_pol_hours, "Slack_OFD_days": slack_ofd_days}
-    )
+    dem_pol_df = pd.DataFrame({
+        "POL Port": pol_vals,
+        "Carrier": carrier_vals,
+        "Dem_POL_hours": dem_pol_hours,
+        "Slack_OFD_days": slack_ofd_days
+    })
 
     dem_pol_summary = (
         dem_pol_df.groupby(["POL Port", "Carrier"])
@@ -701,28 +681,41 @@ with tab_port_carrier:
         )
         .reset_index()
     )
-
     slack_pol_summary = (
         dem_pol_df.groupby(["POL Port", "Carrier"])["Slack_OFD_days"]
-        .apply(slack_group_stats)
-        .unstack()
-        .reset_index()
+        .apply(slack_group_stats).unstack().reset_index()
     )
-
     dem_pol_merged = dem_pol_summary.merge(slack_pol_summary, on=["POL Port", "Carrier"], how="left")
-    st.dataframe(dem_pol_merged, use_container_width=True)
-    st.download_button(
-        "Download Demurrage POL by POL+Carrier (CSV)",
-        dem_pol_merged.to_csv(index=False).encode("utf-8"),
-        file_name="demurrage_pol_by_pol_carrier.csv",
-        mime="text/csv",
+
+    chart_pol = (
+        dem_pol_merged
+        .assign(Label=dem_pol_merged["POL Port"] + " | " + dem_pol_merged["Carrier"])
+        .nlargest(top_n_bar, "Total_Dem_Days")
+        .set_index("Label")[["Total_Dem_Days"]]
+        .sort_values("Total_Dem_Days")
     )
+    st.markdown(f"#### Top {top_n_bar} Port+Carrier combos by Total Demurrage Days (POL)")
+    st.bar_chart(chart_pol, horizontal=True)
+
+    with st.expander("View full table — Demurrage POL"):
+        st.dataframe(dem_pol_merged, use_container_width=True)
+        st.download_button(
+            "Download Demurrage POL by POL+Carrier (CSV)",
+            dem_pol_merged.to_csv(index=False).encode("utf-8"),
+            file_name="demurrage_pol_by_pol_carrier.csv",
+            mime="text/csv",
+        )
 
     st.divider()
+
+    # ---- Detention at POD ----
     st.markdown("### Detention at POD (Gate Out → Empty Return)")
-    det_df = pd.DataFrame(
-        {"POD Port": pod_vals, "Carrier": carrier_vals, "Det_POD_hours": det_pod_hours, "Det_Slack_days": slack_det_days}
-    )
+    det_df = pd.DataFrame({
+        "POD Port": pod_vals,
+        "Carrier": carrier_vals,
+        "Det_POD_hours": det_pod_hours,
+        "Det_Slack_days": slack_det_days
+    })
 
     det_summary = (
         det_df.groupby(["POD Port", "Carrier"])
@@ -736,41 +729,48 @@ with tab_port_carrier:
         )
         .reset_index()
     )
-
     det_slack_summary = (
         det_df.groupby(["POD Port", "Carrier"])["Det_Slack_days"]
-        .apply(slack_group_stats)
-        .unstack()
-        .reset_index()
+        .apply(slack_group_stats).unstack().reset_index()
     )
-
     det_merged = det_summary.merge(det_slack_summary, on=["POD Port", "Carrier"], how="left")
-    st.dataframe(det_merged, use_container_width=True)
-    st.download_button(
-        "Download Detention POD by POD+Carrier (CSV)",
-        det_merged.to_csv(index=False).encode("utf-8"),
-        file_name="detention_pod_by_pod_carrier.csv",
-        mime="text/csv",
+
+    chart_det = (
+        det_merged
+        .assign(Label=det_merged["POD Port"] + " | " + det_merged["Carrier"])
+        .nlargest(top_n_bar, "Total_Det_Days")
+        .set_index("Label")[["Total_Det_Days"]]
+        .sort_values("Total_Det_Days")
     )
+    st.markdown(f"#### Top {top_n_bar} Port+Carrier combos by Total Detention Days (POD)")
+    st.bar_chart(chart_det, horizontal=True)
+
+    with st.expander("View full table — Detention POD"):
+        st.dataframe(det_merged, use_container_width=True)
+        st.download_button(
+            "Download Detention POD by POD+Carrier (CSV)",
+            det_merged.to_csv(index=False).encode("utf-8"),
+            file_name="detention_pod_by_pod_carrier.csv",
+            mime="text/csv",
+        )
 
 # ============================
-# TAB 3: By Lane
+# TAB 3: By Lane — CHANGE 3: stacked horizontal bar by total D&D days
 # ============================
 with tab_lane:
     st.subheader("By Lane (POL → POD)")
+    top_n_lane = st.slider("Show Top N lanes", min_value=5, max_value=30, value=10, step=5)
 
-    lane_df = pd.DataFrame(
-        {
-            "POL Port": pol_vals,
-            "POD Port": pod_vals,
-            "Dem_POL_hours": dem_pol_hours,
-            "Dem_POD_hours": dem_pod_hours,
-            "Det_POD_hours": det_pod_hours,
-            "Slack_LFD_days": slack_lfd_days,
-            "Slack_OFD_days": slack_ofd_days,
-            "Det_Slack_days": slack_det_days,
-        }
-    )
+    lane_df = pd.DataFrame({
+        "POL Port": pol_vals,
+        "POD Port": pod_vals,
+        "Dem_POL_hours": dem_pol_hours,
+        "Dem_POD_hours": dem_pod_hours,
+        "Det_POD_hours": det_pod_hours,
+        "Slack_LFD_days": slack_lfd_days,
+        "Slack_OFD_days": slack_ofd_days,
+        "Det_Slack_days": slack_det_days,
+    })
 
     lane_group = lane_df.groupby(["POL Port", "POD Port"])
 
@@ -789,13 +789,46 @@ with tab_lane:
         },
     ).reset_index()
 
-    st.dataframe(lane_summary, use_container_width=True)
-    st.download_button(
-        "Download Lane Summary (CSV)",
-        lane_summary.to_csv(index=False).encode("utf-8"),
-        file_name="dd_time_by_lane.csv",
-        mime="text/csv",
+    # Compute per-lane totals for each leg and combined total
+    lane_totals = lane_group.agg(
+        Dem_POL_Total=("Dem_POL_hours", lambda s: s.sum() * unit_factor),
+        Dem_POD_Total=("Dem_POD_hours", lambda s: s.sum() * unit_factor),
+        Det_POD_Total=("Det_POD_hours", lambda s: s.sum() * unit_factor),
+    ).reset_index()
+    lane_totals["Total_DD_Days"] = (
+        lane_totals["Dem_POL_Total"] +
+        lane_totals["Dem_POD_Total"] +
+        lane_totals["Det_POD_Total"]
     )
+
+    lane_summary = lane_summary.merge(lane_totals, on=["POL Port", "POD Port"], how="left")
+
+    # Stacked horizontal bar chart — Top N lanes by Total D&D Days
+    chart_lane = (
+        lane_summary
+        .assign(Lane=lane_summary["POL Port"] + " → " + lane_summary["POD Port"])
+        .nlargest(top_n_lane, "Total_DD_Days")
+        .set_index("Lane")[["Dem_POL_Total", "Dem_POD_Total", "Det_POD_Total"]]
+        .sort_values("Dem_POD_Total")
+        .rename(columns={
+            "Dem_POL_Total": "Dem @ POL (days)",
+            "Dem_POD_Total": "Dem @ POD (days)",
+            "Det_POD_Total": "Det @ POD (days)",
+        })
+    )
+
+    st.markdown(f"#### Top {top_n_lane} Lanes by Total D&D Days (Demurrage POL + POD + Detention)")
+    st.bar_chart(chart_lane, horizontal=True)
+    st.caption("Each bar segment: Dem @ POL | Dem @ POD | Det @ POD (stacked total D&D days per lane)")
+
+    with st.expander("View full lane table"):
+        st.dataframe(lane_summary, use_container_width=True)
+        st.download_button(
+            "Download Lane Summary (CSV)",
+            lane_summary.to_csv(index=False).encode("utf-8"),
+            file_name="dd_time_by_lane.csv",
+            mime="text/csv",
+        )
 
 # ============================
 # TAB 4: Shipment Explorer
@@ -885,7 +918,7 @@ with tab_ship:
     )
 
 # =============================================================
-# Overtime Drilldown (same as before)
+# Overtime Drilldown (unchanged)
 # =============================================================
 st.divider()
 st.header("Overtime Drilldown (pick a metric + days-over bucket)")
