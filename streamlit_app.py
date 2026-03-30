@@ -82,7 +82,47 @@ def default_index(colname, cols):
     except Exception:
         return 0
 
+def detect_date_format(series: pd.Series) -> bool:
+    """
+    Auto-detect whether dates in a series are DD/MM or MM/DD.
+    Samples up to 200 non-null string values and looks for unambiguous dates
+    where the first numeric component exceeds 12 (must be a day, not a month).
+    Returns True (dayfirst) if day-first evidence is found, False otherwise.
+    For Excel files the column is already datetime dtype — returns True as safe default.
+    """
+    # If already parsed as datetime by Excel engine, no detection needed
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return True
+
+    sample = series.dropna().astype(str).head(200)
+    day_first_count = 0
+    month_first_count = 0
+
+    for val in sample:
+        val = val.strip()
+        # Match patterns like DD/MM/YYYY, MM/DD/YYYY, DD-MM-YYYY etc.
+        import re
+        m = re.match(r'^(\d{1,2})[/\-\.](\d{1,2})[/\-\.](\d{2,4})', val)
+        if m:
+            first = int(m.group(1))
+            second = int(m.group(2))
+            if first > 12 and second <= 12:
+                day_first_count += 1   # first part must be day
+            elif second > 12 and first <= 12:
+                month_first_count += 1  # second part must be day → month-first
+
+    if day_first_count > month_first_count:
+        return True   # DD/MM/YYYY
+    elif month_first_count > day_first_count:
+        return False  # MM/DD/YYYY
+    else:
+        return True   # ambiguous or ISO — default to dayfirst=True (DD/MM)
+
+
 def to_datetime(series: pd.Series, dayfirst: bool = True) -> pd.Series:
+    # If already datetime (e.g. from Excel), just return coerced directly
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return pd.to_datetime(series, errors='coerce')
     return pd.to_datetime(series, errors='coerce', dayfirst=dayfirst)
 
 def compute_duration_hours(start: pd.Series, end: pd.Series) -> pd.Series:
@@ -322,8 +362,8 @@ st.set_page_config(page_title="D&D Time Analyzer - Control Tower", layout="wide"
 st.title("📦 Demurrage & Detention Time Analyzer (Control Tower view)")
 
 support_msg = []
-support_msg.append("✅ .xlsx (openpyxl)" if HAS_OPENPYXL else "❌ .xlsx (install `openpyxl`)")
-support_msg.append("✅ .xls (xlrd==1.2.0)" if HAS_XLRD12 else "❌ .xls (install `xlrd==1.2.0`)")
+support_msg.append("✅ .xlsx (openpyxl)" if HAS_OPENPYXL else "⚠️ .xlsx (openpyxl not found — install it: pip install openpyxl)")
+support_msg.append("✅ .xls (xlrd==1.2.0)" if HAS_XLRD12 else "⚠️ .xls (xlrd==1.2.0 not found — install it: pip install xlrd==1.2.0)")
 st.info("File support in this environment: " + " | ".join(support_msg))
 
 st.markdown(
@@ -340,11 +380,8 @@ This app focuses **only on Demurrage & Detention time**, *not* on charges.
 # -------------------------------------------------------------
 # File Upload
 # -------------------------------------------------------------
-allowed_types = ["csv"]
-if HAS_OPENPYXL:
-    allowed_types.append("xlsx")
-if HAS_XLRD12:
-    allowed_types.append("xls")
+# Always accept csv, xlsx, xls — engine errors surface with clear messages if library missing
+allowed_types = ["csv", "xlsx", "xls"]
 
 uploaded = st.file_uploader("Upload your shipment file", type=allowed_types)
 if not uploaded:
@@ -357,13 +394,6 @@ if name.endswith(".csv"):
     sheet_name = None
 else:
     is_xlsx = name.endswith(".xlsx")
-    if is_xlsx and not HAS_OPENPYXL:
-        st.error("This environment can't read `.xlsx` yet. Install **openpyxl** or upload CSV.")
-        st.stop()
-    if (not is_xlsx) and (not HAS_XLRD12):
-        st.error("This environment can't read legacy `.xls`. Install **xlrd==1.2.0** or upload CSV.")
-        st.stop()
-
     excel_bytes = load_excel_bytes(uploaded)
     xls, engine = excel_file(excel_bytes, is_xlsx=is_xlsx)
     sheet_name = st.selectbox("Choose sheet", xls.sheet_names, index=0)
@@ -422,10 +452,20 @@ if after_rows < before_rows:
 # -------------------------------------------------------------
 # Locked default Settings (hidden from UI)
 # -------------------------------------------------------------
-dayfirst = True
 unit_factor = 1.0 / 24.0
 unit_label = "days"
 neg_policy = "Treat as NaN (drop from stats)"
+
+# -------------------------------------------------------------
+# Auto-detect date format per timestamp column
+# -------------------------------------------------------------
+_date_cols_for_detection = [gate_in_col, container_loaded_col, discharge_col, gate_out_col, empty_return_col]
+_dayfirst_votes = [detect_date_format(df_raw[c]) for c in _date_cols_for_detection]
+dayfirst = (sum(_dayfirst_votes) >= 3)  # majority vote across all 5 timestamp columns
+
+_fmt_detected = "DD/MM/YYYY" if dayfirst else "MM/DD/YYYY"
+st.info(f"🗓️ Auto-detected date format: **{_fmt_detected}** (based on sampling timestamp columns). "
+        f"If this looks wrong, check your source file's date formatting.")
 
 # -------------------------------------------------------------
 # Compute milestone durations
